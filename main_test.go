@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -245,9 +246,41 @@ func TestResolveCommandInRootfs(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	got := resolveCommandInRootfs(rootfs, []string{"/bin/ryuk"})
+	got := resolveCommandInRootfs(rootfs, nil, []string{"/bin/ryuk"})
 	if len(got) != 1 || got[0] != "/app/ryuk" {
 		t.Fatalf("resolveCommandInRootfs returned %v, want [/app/ryuk]", got)
+	}
+}
+
+func TestResolveCommandInRootfsRewritesEnvShebang(t *testing.T) {
+	rootfs := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rootfs, "usr", "local", "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir script dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(rootfs, "usr", "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir usr/bin: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(rootfs, "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	if err := os.Symlink("/bin/busybox", filepath.Join(rootfs, "usr", "bin", "env")); err != nil {
+		t.Fatalf("symlink env: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "bin", "bash"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write bash: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(rootfs, "usr", "local", "bin", "docker-entrypoint.sh"),
+		[]byte("#!/usr/bin/env bash\nset -e\n"),
+		0o755,
+	); err != nil {
+		t.Fatalf("write entrypoint: %v", err)
+	}
+
+	got := resolveCommandInRootfs(rootfs, nil, []string{"/usr/local/bin/docker-entrypoint.sh", "postgres"})
+	want := []string{"/bin/bash", "/usr/local/bin/docker-entrypoint.sh", "postgres"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("resolveCommandInRootfs returned %v, want %v", got, want)
 	}
 }
 
@@ -285,6 +318,57 @@ func TestNormalizeLayerPath(t *testing.T) {
 		got, ok := normalizeLayerPath(tt.in)
 		if got != tt.want || ok != tt.ok {
 			t.Fatalf("normalizeLayerPath(%q) = (%q,%v), want (%q,%v)", tt.in, got, ok, tt.want, tt.ok)
+		}
+	}
+}
+
+func TestIsRyukImage(t *testing.T) {
+	tests := []struct {
+		image string
+		want  bool
+	}{
+		{image: "testcontainers/ryuk:0.8.1", want: true},
+		{image: "docker.io/testcontainers/ryuk:latest", want: true},
+		{image: "postgres:16-alpine", want: false},
+	}
+	for _, tt := range tests {
+		if got := isRyukImage(tt.image); got != tt.want {
+			t.Fatalf("isRyukImage(%q) = %v, want %v", tt.image, got, tt.want)
+		}
+	}
+}
+
+func TestDockerHostForInnerClients(t *testing.T) {
+	tests := []struct {
+		host string
+		want string
+	}{
+		{host: "127.0.0.1:8080", want: "tcp://127.0.0.1:8080"},
+		{host: "", want: "tcp://127.0.0.1:8080"},
+		{host: "tcp://10.0.0.5:2375", want: "tcp://10.0.0.5:2375"},
+	}
+	for _, tt := range tests {
+		if got := dockerHostForInnerClients(tt.host); got != tt.want {
+			t.Fatalf("dockerHostForInnerClients(%q) = %q, want %q", tt.host, got, tt.want)
+		}
+	}
+}
+
+func TestRequestTimeoutFor(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		target string
+		want   time.Duration
+	}{
+		{name: "default", method: http.MethodGet, target: "/version", want: 30 * time.Second},
+		{name: "images create", method: http.MethodPost, target: "/images/create?fromImage=redis", want: 10 * time.Minute},
+		{name: "logs follow", method: http.MethodGet, target: "/containers/abc/logs?follow=true", want: 0},
+	}
+	for _, tt := range tests {
+		req := httptest.NewRequest(tt.method, tt.target, nil)
+		if got := requestTimeoutFor(req); got != tt.want {
+			t.Fatalf("%s: requestTimeoutFor(%s %s) = %s, want %s", tt.name, tt.method, tt.target, got, tt.want)
 		}
 	}
 }

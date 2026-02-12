@@ -2,9 +2,9 @@ package main
 
 import (
 	"archive/tar"
-	"encoding/binary"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -32,24 +32,35 @@ import (
 )
 
 type Container struct {
-	ID      string    `json:"Id"`
-	Name    string    `json:"Name,omitempty"`
-	Image   string    `json:"Image"`
-	Rootfs  string    `json:"Rootfs"`
-	Created time.Time `json:"Created"`
-	Running bool      `json:"Running"`
-	Ports   map[int]int
-	Env     []string `json:"Env"`
-	LogPath string   `json:"LogPath"`
-	Pid     int      `json:"Pid"`
-	Cmd     []string `json:"Cmd"`
+	ID         string    `json:"Id"`
+	Name       string    `json:"Name,omitempty"`
+	Image      string    `json:"Image"`
+	Rootfs     string    `json:"Rootfs"`
+	Created    time.Time `json:"Created"`
+	Running    bool      `json:"Running"`
+	Ports      map[int]int
+	Env        []string `json:"Env"`
+	LogPath    string   `json:"LogPath"`
+	Pid        int      `json:"Pid"`
+	Cmd        []string `json:"Cmd"`
+	WorkingDir string   `json:"WorkingDir"`
 }
 
 type containerStore struct {
 	mu         sync.Mutex
 	containers map[string]*Container
+	execs      map[string]*ExecInstance
 	stateDir   string
 	proxies    map[string][]*portProxy
+}
+
+type ExecInstance struct {
+	ID          string
+	ContainerID string
+	Cmd         []string
+	Running     bool
+	ExitCode    int
+	Output      []byte
 }
 
 type metrics struct {
@@ -65,8 +76,19 @@ type createRequest struct {
 	Cmd          []string            `json:"Cmd"`
 	Env          []string            `json:"Env"`
 	Entrypoint   []string            `json:"Entrypoint"`
+	WorkingDir   string              `json:"WorkingDir"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 	HostConfig   hostConfig          `json:"HostConfig"`
+}
+
+type execCreateRequest struct {
+	Cmd          []string `json:"Cmd"`
+	AttachStdout bool     `json:"AttachStdout"`
+	AttachStderr bool     `json:"AttachStderr"`
+}
+
+type execCreateResponse struct {
+	ID string `json:"Id"`
 }
 
 type hostConfig struct {
@@ -87,12 +109,14 @@ type errorResponse struct {
 }
 
 type imageMeta struct {
-	Reference  string   `json:"Reference"`
-	Digest     string   `json:"Digest"`
-	Entrypoint []string `json:"Entrypoint"`
-	Cmd        []string `json:"Cmd"`
-	Env        []string `json:"Env"`
-	Extractor  string   `json:"Extractor,omitempty"`
+	Reference    string              `json:"Reference"`
+	Digest       string              `json:"Digest"`
+	Entrypoint   []string            `json:"Entrypoint"`
+	Cmd          []string            `json:"Cmd"`
+	Env          []string            `json:"Env"`
+	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
+	WorkingDir   string              `json:"WorkingDir"`
+	Extractor    string              `json:"Extractor,omitempty"`
 }
 
 type runtimeLimits struct {
@@ -154,6 +178,7 @@ func main() {
 
 	store := &containerStore{
 		containers: make(map[string]*Container),
+		execs:      make(map[string]*ExecInstance),
 		stateDir:   *stateDir,
 		proxies:    make(map[string][]*portProxy),
 	}
@@ -186,6 +211,7 @@ func main() {
 	})
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
+			"Version":       version,
 			"ApiVersion":    "1.41",
 			"MinAPIVersion": "1.12",
 			"Os":            "linux",
@@ -286,6 +312,18 @@ func main() {
 				return
 			}
 			handleStart(w, r, store, m, limits, id)
+		case "kill":
+			if r.Method != http.MethodPost {
+				writeError(w, http.StatusNotFound, "not found")
+				return
+			}
+			handleKill(w, r, store, id)
+		case "exec":
+			if r.Method != http.MethodPost {
+				writeError(w, http.StatusNotFound, "not found")
+				return
+			}
+			handleExecCreate(w, r, store, id)
 		case "stop":
 			if r.Method != http.MethodPost {
 				writeError(w, http.StatusNotFound, "not found")
@@ -312,6 +350,35 @@ func main() {
 			writeError(w, http.StatusNotFound, "not found")
 		}
 	})
+	mux.HandleFunc("/exec/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/exec/")
+		parts := strings.Split(path, "/")
+		if len(parts) < 1 || parts[0] == "" {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		id := parts[0]
+		action := ""
+		if len(parts) > 1 {
+			action = parts[1]
+		}
+		switch action {
+		case "start":
+			if r.Method != http.MethodPost {
+				writeError(w, http.StatusNotFound, "not found")
+				return
+			}
+			handleExecStart(w, r, store, id)
+		case "json":
+			if r.Method != http.MethodGet {
+				writeError(w, http.StatusNotFound, "not found")
+				return
+			}
+			handleExecJSON(w, r, store, id)
+		default:
+			writeError(w, http.StatusNotFound, "not found")
+		}
+	})
 	mux.HandleFunc("/containers/json", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusNotFound, "not found")
@@ -326,8 +393,12 @@ func main() {
 		Handler:           timeoutMiddleware(apiVersionMiddleware(mux)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// Keep write timeout disabled to avoid breaking long-lived Docker client streams.
+		// Request-level API timeouts are already enforced by timeoutMiddleware.
+		WriteTimeout: 0,
+		// Docker clients commonly keep pooled HTTP connections for ~3 minutes.
+		// Keep idle timeout above that to avoid NoHttpResponseException on reuse.
+		IdleTimeout: 5 * time.Minute,
 	}
 
 	fmt.Printf("tcexecutor listening on %s\n", *listenAddr)
@@ -339,10 +410,27 @@ func main() {
 
 func timeoutMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		timeout := requestTimeoutFor(r)
+		if timeout <= 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func requestTimeoutFor(r *http.Request) time.Duration {
+	// Image pulls can take much longer than normal control-plane calls.
+	if r.Method == http.MethodPost && r.URL.Path == "/images/create" {
+		return 10 * time.Minute
+	}
+	// Docker clients may keep log follow streams open for long periods.
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/logs") && parseDockerBool(r.URL.Query().Get("follow"), false) {
+		return 0
+	}
+	return 30 * time.Second
 }
 
 func requireUnprivilegedRuntime(euid int) error {
@@ -352,7 +440,7 @@ func requireUnprivilegedRuntime(euid int) error {
 	return nil
 }
 
-func buildContainerCommand(rootfs string, cmdArgs []string) (*exec.Cmd, error) {
+func buildContainerCommand(rootfs, workingDir string, cmdArgs []string) (*exec.Cmd, error) {
 	if len(cmdArgs) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
@@ -360,14 +448,27 @@ func buildContainerCommand(rootfs string, cmdArgs []string) (*exec.Cmd, error) {
 	if err != nil {
 		return nil, err
 	}
+	if workingDir == "" {
+		workingDir = "/"
+	}
+	// -r: explicit guest rootfs (avoiding -R auto-binds)
+	// -b /proc, /dev, /tmp: explicit essential binds
+	// -w: set working directory
 	args := []string{
-		"-0",
-		"-R", rootfs,
-		"-w", "/",
+		"-r", rootfs,
 		"-b", "/proc",
 		"-b", "/dev",
 		"-b", "/tmp",
+		"-w", workingDir,
 	}
+	// Wrap with /usr/bin/env to ensure the guest environment is used for resolution
+	// if /usr/bin/env exists in the guest, otherwise use the command directly.
+	if fileExists(filepath.Join(rootfs, "/usr/bin/env")) {
+		args = append(args, "/usr/bin/env")
+	} else if fileExists(filepath.Join(rootfs, "/bin/env")) {
+		args = append(args, "/bin/env")
+	}
+
 	args = append(args, cmdArgs...)
 	return exec.Command(prootPath, args...), nil
 }
@@ -512,24 +613,36 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 	}
 
 	env := mergeEnv(meta.Env, req.Env)
+	if isRyukImage(resolvedRef) || isRyukImage(req.Image) {
+		env = mergeEnv(env, []string{"DOCKER_HOST=" + dockerHostForInnerClients(r.Host)})
+	}
+	workingDir := req.WorkingDir
+	if workingDir == "" {
+		workingDir = meta.WorkingDir
+	}
+	if workingDir == "" {
+		workingDir = "/"
+	}
 
-	ports, err := resolvePortBindings(req)
+	allExposed := mergeExposedPorts(meta.ExposedPorts, req.ExposedPorts)
+	ports, err := resolvePortBindings(allExposed, req.HostConfig.PortBindings)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	c := &Container{
-		ID:      id,
-		Name:    name,
-		Image:   req.Image,
-		Rootfs:  rootfs,
-		Created: time.Now().UTC(),
-		Running: false,
-		Ports:   ports,
-		Env:     env,
-		LogPath: logPath,
-		Cmd:     append(entrypoint, cmd...),
+		ID:         id,
+		Name:       name,
+		Image:      req.Image,
+		Rootfs:     rootfs,
+		Created:    time.Now().UTC(),
+		Running:    false,
+		Ports:      ports,
+		Env:        env,
+		WorkingDir: workingDir,
+		LogPath:    logPath,
+		Cmd:        append(entrypoint, cmd...),
 	}
 
 	if err := store.save(c); err != nil {
@@ -565,9 +678,9 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 	if len(cmdArgs) == 0 {
 		cmdArgs = []string{"sleep", "3600"}
 	}
-	cmdArgs = resolveCommandInRootfs(c.Rootfs, cmdArgs)
+	cmdArgs = resolveCommandInRootfs(c.Rootfs, c.Env, cmdArgs)
 
-	cmd, err := buildContainerCommand(c.Rootfs, cmdArgs)
+	cmd, err := buildContainerCommand(c.Rootfs, c.WorkingDir, cmdArgs)
 	if err != nil {
 		if reserved {
 			m.mu.Lock()
@@ -580,7 +693,9 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 		return
 	}
 	cmd.Dir = "/"
-	cmd.Env = append(os.Environ(), c.Env...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Deduplicate environment variables, favoring container env over host env
+	cmd.Env = deduplicateEnv(append(os.Environ(), c.Env...))
 
 	logFile, err := os.OpenFile(c.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -597,6 +712,10 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
+	// Also log to server stdout
+	fmt.Printf("tcexecutor: starting container %s (id %s)\n", c.Name, c.ID)
+	fmt.Printf("tcexecutor: command: %s %s\n", cmd.Path, strings.Join(cmd.Args[1:], " "))
+
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		m.mu.Lock()
@@ -611,7 +730,7 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 
 	proxies, err := startPortProxies(c.Ports)
 	if err != nil {
-		_ = cmd.Process.Kill()
+		_ = killProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 		logFile.Close()
 		if reserved {
 			m.mu.Lock()
@@ -628,7 +747,7 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 	c.Running = true
 	c.Pid = cmd.Process.Pid
 	if err := store.save(c); err != nil {
-		_ = cmd.Process.Kill()
+		_ = killProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 		store.stopProxies(c.ID)
 		logFile.Close()
 		if reserved {
@@ -673,18 +792,23 @@ func handleStop(w http.ResponseWriter, r *http.Request, store *containerStore, i
 		return
 	}
 
-	_ = syscall.Kill(c.Pid, syscall.SIGTERM)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !processAlive(c.Pid) {
-			store.stopProxies(c.ID)
-			store.markStopped(c.ID)
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
+	terminateProcessTree(c.Pid, 2*time.Second)
+	store.stopProxies(c.ID)
+	store.markStopped(c.ID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleKill(w http.ResponseWriter, r *http.Request, store *containerStore, id string) {
+	c, ok := store.get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "container not found")
+		return
 	}
-	_ = syscall.Kill(c.Pid, syscall.SIGKILL)
+	if !c.Running || c.Pid == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	terminateProcessTree(c.Pid, 0)
 	store.stopProxies(c.ID)
 	store.markStopped(c.ID)
 	w.WriteHeader(http.StatusNoContent)
@@ -697,8 +821,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request, store *containerStore,
 		return
 	}
 	if c.Running {
-		_ = syscall.Kill(c.Pid, syscall.SIGTERM)
-		_ = syscall.Kill(c.Pid, syscall.SIGKILL)
+		terminateProcessTree(c.Pid, 2*time.Second)
 		store.stopProxies(c.ID)
 		store.markStopped(c.ID)
 	}
@@ -750,15 +873,104 @@ func handleJSON(w http.ResponseWriter, r *http.Request, store *containerStore, i
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func handleLogs(w http.ResponseWriter, r *http.Request, store *containerStore, id string) {
+func handleExecCreate(w http.ResponseWriter, r *http.Request, store *containerStore, id string) {
 	c, ok := store.get(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, "container not found")
 		return
 	}
-	data, err := os.ReadFile(c.LogPath)
+	var req execCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if len(req.Cmd) == 0 {
+		writeError(w, http.StatusBadRequest, "missing exec command")
+		return
+	}
+	execID, err := randomID(12)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "log read failed")
+		writeError(w, http.StatusInternalServerError, "id generation failed")
+		return
+	}
+	inst := &ExecInstance{
+		ID:          execID,
+		ContainerID: c.ID,
+		Cmd:         append([]string{}, req.Cmd...),
+		ExitCode:    -1,
+	}
+	store.saveExec(inst)
+	writeJSON(w, http.StatusCreated, execCreateResponse{ID: execID})
+}
+
+func handleExecStart(w http.ResponseWriter, r *http.Request, store *containerStore, execID string) {
+	inst, ok := store.getExec(execID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "exec instance not found")
+		return
+	}
+	c, ok := store.get(inst.ContainerID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "container not found")
+		return
+	}
+	cmdArgs := resolveCommandInRootfs(c.Rootfs, c.Env, inst.Cmd)
+	cmd, err := buildContainerCommand(c.Rootfs, c.WorkingDir, cmdArgs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "exec start failed: "+err.Error())
+		return
+	}
+	cmd.Dir = "/"
+	cmd.Env = deduplicateEnv(append(os.Environ(), c.Env...))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	var buf strings.Builder
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	inst.Running = true
+	store.saveExec(inst)
+	runErr := cmd.Run()
+	inst.Running = false
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			inst.ExitCode = exitErr.ExitCode()
+		} else {
+			inst.ExitCode = 126
+		}
+	} else {
+		inst.ExitCode = 0
+	}
+	inst.Output = []byte(buf.String())
+	store.saveExec(inst)
+
+	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+	w.WriteHeader(http.StatusOK)
+	if len(inst.Output) > 0 {
+		_, _ = w.Write(frameDockerRawStream(1, inst.Output))
+	}
+}
+
+func handleExecJSON(w http.ResponseWriter, r *http.Request, store *containerStore, execID string) {
+	inst, ok := store.getExec(execID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "exec instance not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ID":         inst.ID,
+		"Running":    inst.Running,
+		"ExitCode":   inst.ExitCode,
+		"ProcessConfig": map[string]interface{}{
+			"entrypoint": firstArg(inst.Cmd),
+			"arguments":  restArgs(inst.Cmd),
+		},
+	})
+}
+
+func handleLogs(w http.ResponseWriter, r *http.Request, store *containerStore, id string) {
+	c, ok := store.get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "container not found")
 		return
 	}
 	includeStdout := parseDockerBool(r.URL.Query().Get("stdout"), true)
@@ -767,13 +979,76 @@ func handleLogs(w http.ResponseWriter, r *http.Request, store *containerStore, i
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	follow := parseDockerBool(r.URL.Query().Get("follow"), false)
 	stream := byte(1)
 	if !includeStdout && includeStderr {
 		stream = 2
 	}
+
+	logFile, err := os.Open(c.LogPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "log read failed")
+		return
+	}
+	defer logFile.Close()
+
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(frameDockerRawStream(stream, data))
+
+	flush := func() {
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+	offset := int64(0)
+	writeNew := func() error {
+		stat, err := logFile.Stat()
+		if err != nil {
+			return err
+		}
+		size := stat.Size()
+		if size <= offset {
+			return nil
+		}
+		chunk := make([]byte, size-offset)
+		n, err := logFile.ReadAt(chunk, offset)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		offset += int64(n)
+		if n == 0 {
+			return nil
+		}
+		_, _ = w.Write(frameDockerRawStream(stream, chunk[:n]))
+		flush()
+		return nil
+	}
+
+	if err := writeNew(); err != nil {
+		return
+	}
+	if !follow {
+		return
+	}
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if err := writeNew(); err != nil {
+				return
+			}
+			current, ok := store.get(id)
+			if !ok || !current.Running {
+				_ = writeNew()
+				return
+			}
+		}
+	}
 }
 
 func (s *containerStore) init() error {
@@ -924,6 +1199,19 @@ func (s *containerStore) stopProxies(id string) {
 	}
 }
 
+func (s *containerStore) saveExec(inst *ExecInstance) {
+	s.mu.Lock()
+	s.execs[inst.ID] = inst
+	s.mu.Unlock()
+}
+
+func (s *containerStore) getExec(id string) (*ExecInstance, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	inst, ok := s.execs[id]
+	return inst, ok
+}
+
 func randomID(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -953,41 +1241,132 @@ func processAlive(pid int) bool {
 	return process.Signal(syscall.Signal(0)) == nil
 }
 
-func resolveCommandInRootfs(rootfs string, cmdArgs []string) []string {
+func resolveCommandInRootfs(rootfs string, env []string, cmdArgs []string) []string {
 	if len(cmdArgs) == 0 {
 		return cmdArgs
 	}
-	cmd := strings.TrimSpace(cmdArgs[0])
-	if cmd == "" || !strings.HasPrefix(cmd, "/") {
-		return cmdArgs
+	adjusted := append([]string{}, cmdArgs...)
+	if resolved, ok := resolveBinaryPathInRootfs(rootfs, env, adjusted[0]); ok {
+		adjusted[0] = resolved
 	}
-	joined := filepath.Join(rootfs, strings.TrimPrefix(cmd, "/"))
-	if fileExists(joined) {
-		return cmdArgs
+	return rewriteShebangCommand(rootfs, env, adjusted)
+}
+
+func resolveBinaryPathInRootfs(rootfs string, env []string, cmd string) (string, bool) {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return "", false
 	}
-	base := filepath.Base(cmd)
-	for _, dir := range []string{"/bin", "/usr/bin", "/usr/local/bin", "/app", "/"} {
-		candidate := filepath.Join(rootfs, strings.TrimPrefix(dir, "/"), base)
-		if fileExists(candidate) {
-			adjusted := append([]string{}, cmdArgs...)
-			adjusted[0] = filepath.Join(dir, base)
-			return adjusted
+
+	// If absolute path provided, check it directly.
+	if strings.HasPrefix(cmd, "/") {
+		joined := filepath.Join(rootfs, strings.TrimPrefix(cmd, "/"))
+		if fileExists(joined) {
+			return cmd, true
 		}
 	}
-	if found, ok := findExecutableByBase(rootfs, base); ok {
-		adjusted := append([]string{}, cmdArgs...)
-		adjusted[0] = found
-		return adjusted
+
+	// Try searching in PATH from env.
+	pathVal := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			pathVal = strings.TrimPrefix(e, "PATH=")
+			break
+		}
 	}
-	return cmdArgs
+	base := filepath.Base(cmd)
+	searchDirs := strings.Split(pathVal, ":")
+	searchDirs = append(searchDirs, "/app", "/")
+	for _, dir := range searchDirs {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			continue
+		}
+		candidate := filepath.Join(rootfs, strings.TrimPrefix(dir, "/"), base)
+		if fileExists(candidate) {
+			return filepath.Join(dir, base), true
+		}
+	}
+
+	// Exhaustive search as a last resort.
+	if found, ok := findExecutableByBase(rootfs, base); ok {
+		return found, true
+	}
+
+	return "", false
+}
+
+func rewriteShebangCommand(rootfs string, env []string, cmdArgs []string) []string {
+	if len(cmdArgs) == 0 {
+		return cmdArgs
+	}
+	if !strings.HasPrefix(cmdArgs[0], "/") {
+		return cmdArgs
+	}
+
+	scriptPath := filepath.Join(rootfs, strings.TrimPrefix(cmdArgs[0], "/"))
+	line, err := readFirstLine(scriptPath)
+	if err != nil || !strings.HasPrefix(line, "#!") {
+		return cmdArgs
+	}
+
+	fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "#!")))
+	if len(fields) == 0 {
+		return cmdArgs
+	}
+
+	interpreter := fields[0]
+	interpArgs := fields[1:]
+	if interpreter == "/usr/bin/env" || interpreter == "/bin/env" {
+		if len(interpArgs) == 0 {
+			return cmdArgs
+		}
+		interpreter = interpArgs[0]
+		interpArgs = interpArgs[1:]
+	}
+
+	resolvedInterp, ok := resolveBinaryPathInRootfs(rootfs, env, interpreter)
+	if !ok {
+		return cmdArgs
+	}
+
+	rewritten := []string{resolvedInterp}
+	rewritten = append(rewritten, interpArgs...)
+	rewritten = append(rewritten, cmdArgs...)
+	return rewritten
+}
+
+func readFirstLine(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	if n == 0 {
+		return "", io.EOF
+	}
+	line := string(buf[:n])
+	if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+		line = line[:idx]
+	}
+	return strings.TrimSuffix(line, "\r"), nil
 }
 
 func fileExists(path string) bool {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return false
 	}
-	return info.Mode().IsRegular() || (info.Mode()&os.ModeSymlink) != 0
+	if info.Mode()&os.ModeSymlink != 0 {
+		return true
+	}
+	return info.Mode().IsRegular()
 }
 
 func findExecutableByBase(rootfs string, base string) (string, bool) {
@@ -1303,9 +1682,9 @@ func parsePort(port string) (int, error) {
 	return p, nil
 }
 
-func resolvePortBindings(req createRequest) (map[int]int, error) {
+func resolvePortBindings(exposedPorts map[string]struct{}, hostBindings map[string][]portBinding) (map[int]int, error) {
 	ports := map[int]int{}
-	for port := range req.ExposedPorts {
+	for port := range exposedPorts {
 		cp, err := parsePort(port)
 		if err != nil {
 			return nil, err
@@ -1318,7 +1697,7 @@ func resolvePortBindings(req createRequest) (map[int]int, error) {
 			ports[cp] = hp
 		}
 	}
-	for port, bindings := range req.HostConfig.PortBindings {
+	for port, bindings := range hostBindings {
 		cp, err := parsePort(port)
 		if err != nil {
 			return nil, err
@@ -1468,25 +1847,51 @@ func monitorContainer(id string, pid int, logPath string, store *containerStore,
 			return
 		}
 		if limits.maxRuntime > 0 && time.Now().After(deadline) {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+			_ = killProcessGroup(pid, syscall.SIGKILL)
 			store.markStopped(id)
 			return
 		}
 		if limits.maxLogBytes > 0 {
 			if info, err := os.Stat(logPath); err == nil && info.Size() > limits.maxLogBytes {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
+				_ = killProcessGroup(pid, syscall.SIGKILL)
 				store.markStopped(id)
 				return
 			}
 		}
 		if limits.maxMemBytes > 0 {
 			if rss, err := readRSS(pid); err == nil && rss > limits.maxMemBytes {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
+				_ = killProcessGroup(pid, syscall.SIGKILL)
 				store.markStopped(id)
 				return
 			}
 		}
 	}
+}
+
+func terminateProcessTree(pid int, grace time.Duration) {
+	if pid <= 0 {
+		return
+	}
+	_ = killProcessGroup(pid, syscall.SIGTERM)
+	if grace <= 0 {
+		_ = killProcessGroup(pid, syscall.SIGKILL)
+		return
+	}
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = killProcessGroup(pid, syscall.SIGKILL)
+}
+
+func killProcessGroup(pid int, sig syscall.Signal) error {
+	if pid <= 0 {
+		return nil
+	}
+	return syscall.Kill(-pid, sig)
 }
 
 func readRSS(pid int) (int64, error) {
@@ -1549,6 +1954,41 @@ func splitEnv(env string) (string, string) {
 	return parts[0], parts[1]
 }
 
+func deduplicateEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	seen := map[string]int{}
+	for _, e := range env {
+		key, _ := splitEnv(e)
+		if key == "" {
+			continue
+		}
+		if idx, ok := seen[key]; ok {
+			out[idx] = e
+			continue
+		}
+		seen[key] = len(out)
+		out = append(out, e)
+	}
+	return out
+}
+
+func isRyukImage(image string) bool {
+	norm := strings.ToLower(strings.TrimSpace(image))
+	norm = strings.TrimPrefix(norm, "docker.io/")
+	return strings.Contains(norm, "testcontainers/ryuk")
+}
+
+func dockerHostForInnerClients(requestHost string) string {
+	host := strings.TrimSpace(requestHost)
+	if host == "" {
+		return "tcp://127.0.0.1:8080"
+	}
+	if strings.Contains(host, "://") {
+		return host
+	}
+	return "tcp://" + host
+}
+
 func listImages(stateDir string) ([]map[string]interface{}, error) {
 	imageRoot := filepath.Join(stateDir, "images")
 	entries, err := os.ReadDir(imageRoot)
@@ -1575,6 +2015,17 @@ func listImages(stateDir string) ([]map[string]interface{}, error) {
 		})
 	}
 	return out, nil
+}
+
+func mergeExposedPorts(base, override map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{})
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range override {
+		out[k] = v
+	}
+	return out
 }
 
 func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (string, imageMeta, error) {
@@ -1644,6 +2095,8 @@ func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (
 		meta.Entrypoint = cfg.Config.Entrypoint
 		meta.Cmd = cfg.Config.Cmd
 		meta.Env = cfg.Config.Env
+		meta.ExposedPorts = cfg.Config.ExposedPorts
+		meta.WorkingDir = cfg.Config.WorkingDir
 	}
 	if data, err := json.MarshalIndent(meta, "", "  "); err == nil {
 		_ = os.WriteFile(metaPath, data, 0o644)
@@ -1827,16 +2280,20 @@ func copyDir(src, dst string) error {
 			if err != nil {
 				return err
 			}
-			defer srcFile.Close()
-			dstFile, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+			// Use a closure or explicit Close to avoid leaking descriptors in WalkDir
+			err = func() error {
+				defer srcFile.Close()
+				dstFile, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+				if err != nil {
+					return err
+				}
+				defer dstFile.Close()
+				_, err = io.Copy(dstFile, srcFile)
+				return err
+			}()
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(dstFile, srcFile); err != nil {
-				dstFile.Close()
-				return err
-			}
-			dstFile.Close()
 			return nil
 		}
 		return nil
