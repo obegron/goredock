@@ -22,6 +22,7 @@ Current focus:
 - Unix socket listener (default: `<state-dir>/docker.sock`) for in-container Docker clients
 - Image pulling and rootfs extraction
 - Port publishing through TCP proxying
+- Health and readiness probes (`/healthz`, `/readyz`)
 - In-cluster sidecar run in k3d for PostgreSQL test (`DatabaseTest`) passed
 
 ## Known Gaps / Limitations
@@ -104,3 +105,14 @@ NO_PROXY=127.0.0.1,localhost \
 make smoke-pull IMAGE_NAME=sidewhale VERSION=dev \
   SIDEWHALE_RUN_ARGS="--trust-insecure"
 ```
+
+## In-Repo Testcontainers Smoke Tests
+
+Run the Java smoke tests in `it/testcontainers-smoke` against a running Sidewhale endpoint:
+
+```bash
+export DOCKER_HOST=tcp://127.0.0.1:23750
+make integration-test
+```
+
+By default this target sets `TESTCONTAINERS_RYUK_DISABLED=true`. Override if needed.

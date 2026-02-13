@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 func (s *containerStore) init() error {
@@ -173,4 +174,48 @@ func (s *containerStore) getExec(id string) (*ExecInstance, bool) {
 	defer s.mu.Unlock()
 	inst, ok := s.execs[id]
 	return inst, ok
+}
+
+func (s *containerStore) stopAllRunning(grace time.Duration) int {
+	type stopTarget struct {
+		id      string
+		running bool
+		pid     int
+	}
+
+	s.mu.Lock()
+	targets := make([]stopTarget, 0, len(s.containers))
+	extraProxyIDs := make([]string, 0, len(s.proxies))
+	for _, c := range s.containers {
+		targets = append(targets, stopTarget{
+			id:      c.ID,
+			running: c.Running,
+			pid:     c.Pid,
+		})
+	}
+	for id := range s.proxies {
+		extraProxyIDs = append(extraProxyIDs, id)
+	}
+	s.mu.Unlock()
+
+	stopped := 0
+	knownIDs := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		knownIDs[target.id] = struct{}{}
+		s.stopProxies(target.id)
+		if target.running {
+			if target.pid > 0 {
+				terminateProcessTree(target.pid, grace)
+			}
+			s.markStopped(target.id)
+			stopped++
+		}
+	}
+	for _, id := range extraProxyIDs {
+		if _, ok := knownIDs[id]; ok {
+			continue
+		}
+		s.stopProxies(id)
+	}
+	return stopped
 }

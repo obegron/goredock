@@ -6,7 +6,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PLATFORM ?= linux/amd64
 LDFLAGS := -s -w -X 'main.version=$(VERSION)'
 
-.PHONY: help build image docker-build docker-push image-run smoke-pull clean
+.PHONY: help build image docker-build docker-push image-run smoke-pull integration-test clean
 
 help:
 	@echo "Targets:"
@@ -16,6 +16,7 @@ help:
 	@echo "  docker-push   Build and push image with provenance + SBOM"
 	@echo "  image-run   Run image in host network mode and print DOCKER_HOST env var"
 	@echo "  smoke-pull  Quick API smoke test (ping/version + image pull)"
+	@echo "  integration-test Run Java Testcontainers smoke tests against Sidewhale"
 	@echo "  clean   Remove build artifacts"
 	@echo "Variables:"
 	@echo "  VERSION    Override version tag (default: git describe or dev)"
@@ -44,6 +45,7 @@ image-run:
 
 SMOKE_IMAGE ?= redis:7-alpine
 SIDEWHALE_RUN_ARGS ?=
+IT_SMOKE_DIR ?= it/testcontainers-smoke
 
 smoke-pull:
 	@set -euo pipefail; \
@@ -56,6 +58,17 @@ smoke-pull:
 	curl -fsS http://127.0.0.1:23750/version >/dev/null; \
 	curl -fsS -X POST "http://127.0.0.1:23750/v1.41/images/create?fromImage=$(SMOKE_IMAGE)" >/dev/null; \
 	echo "smoke ok: pulled $(SMOKE_IMAGE)"
+
+integration-test:
+	@set -euo pipefail; \
+	export DOCKER_HOST="$${DOCKER_HOST:-tcp://127.0.0.1:23750}"; \
+	export TESTCONTAINERS_RYUK_DISABLED="$${TESTCONTAINERS_RYUK_DISABLED:-true}"; \
+	if ! curl -fsS "$${DOCKER_HOST/tcp:\/\//http:\/\/}/version" >/dev/null; then \
+		echo "sidewhale not reachable at $$DOCKER_HOST (start sidewhale first)"; \
+		exit 1; \
+	fi; \
+	cd "$(IT_SMOKE_DIR)"; \
+	mvn -q test
 
 clean:
 	rm -f $(BINARY)
