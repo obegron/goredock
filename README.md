@@ -1,0 +1,78 @@
+<p align="center">
+  <img src="assets/sidewhale-logo.png" alt="sidewhale logo" width="560" />
+</p>
+
+# sidewhale
+
+`sidewhale` is a small Docker API shim for running Testcontainers workloads without a Docker daemon.
+
+It is not a container runtime and does not try to be Docker-compatible beyond what Testcontainers needs.
+
+## Status
+
+Early project. No compatibility or stability guarantees.
+
+Current focus:
+
+- Kubernetes sidecar usage
+- Testcontainers integration tests
+- Simple and deterministic behavior
+
+## What Works Right Now
+
+- Basic Testcontainers lifecycle (`create`, `start`, `inspect`, `logs`, `stop`, `delete`)
+- Image pulling and rootfs extraction
+- Port publishing through TCP proxying
+- In-cluster sidecar run in k3d for PostgreSQL test (`DatabaseTest`) passed
+
+## Known Gaps / Limitations
+
+- No registry auth management beyond pass-through headers from clients
+- Insecure registry configuration is not implemented as a runtime flag yet
+- Oracle image currently fails under `proot` due missing syscall behavior
+- Some clients may log noisy `Socket closed` traces when log-follow streams are closed
+- No support for many Docker APIs (networks, volumes, build, exec/attach parity, etc.)
+
+## Docker API Support Matrix
+
+Implemented:
+
+- `GET /_ping`
+- `GET /version`
+- `GET /info`
+- `POST /images/create`
+- `GET /images/json`
+- `GET /images/{name}/json` (returns 404 when not present)
+- `POST /containers/create`
+- `POST /containers/{id}/start`
+- `POST /containers/{id}/stop`
+- `POST /containers/{id}/kill`
+- `DELETE /containers/{id}`
+- `GET /containers/{id}/json`
+- `GET /containers/{id}/logs`
+- `GET /containers/{id}/stats`
+- `POST /containers/{id}/wait`
+- `GET /containers/{id}/archive`
+- `PUT /containers/{id}/archive`
+
+Partially implemented / best-effort:
+
+- `POST /exec/{id}/start`
+- `GET /exec/{id}/json`
+
+Not implemented:
+
+- Most other Docker endpoints return `404`.
+
+## Quick Run
+
+```bash
+docker build -t sidewhale:dev .
+docker run --rm --network host sidewhale:dev --listen :23750
+```
+
+Then point Testcontainers/Docker client to:
+
+```bash
+DOCKER_HOST=tcp://127.0.0.1:23750
+```
