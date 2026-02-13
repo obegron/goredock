@@ -61,6 +61,9 @@ func newRouter(store *containerStore, m *metrics, cfg appConfig, probes *probeSt
 		handleImagesCreate(w, r, store, m, cfg, ensureImage)
 	})
 	mux.HandleFunc("/images/prune", handleImagesPrune)
+	mux.HandleFunc("/images/", func(w http.ResponseWriter, r *http.Request) {
+		handleImageInspect(w, r, store.stateDir, cfg.mirrorRules)
+	})
 	mux.HandleFunc("/images/json", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusNotFound, "not found")

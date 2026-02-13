@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -104,5 +107,42 @@ func TestImageTagLooksLikeDigest(t *testing.T) {
 		if got := imageTagLooksLikeDigest(tt.tag); got != tt.want {
 			t.Fatalf("imageTagLooksLikeDigest(%q) = %v, want %v", tt.tag, got, tt.want)
 		}
+	}
+}
+
+func TestHandleImageInspectFindsMirroredReference(t *testing.T) {
+	stateDir := t.TempDir()
+	imageDir := filepath.Join(stateDir, "images", "sha256_deadbeef")
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
+		t.Fatalf("mkdir image dir: %v", err)
+	}
+	meta := imageMeta{
+		Reference:   "127.0.0.1:5001/library/alpine:latest",
+		Digest:      "sha256:deadbeef",
+		ContentSize: 123,
+		DiskUsage:   456,
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(imageDir, "image.json"), data, 0o644); err != nil {
+		t.Fatalf("write image metadata: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/images/testcontainers%2Fhelloworld:latest/json", nil)
+	rec := httptest.NewRecorder()
+	handleImageInspect(rec, req, stateDir, []imageMirrorRule{
+		{FromPrefix: "testcontainers/helloworld:latest", ToPrefix: "127.0.0.1:5001/library/alpine:latest"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid json response: %v", err)
+	}
+	if payload["Id"] != "sha256:deadbeef" {
+		t.Fatalf("Id = %v, want sha256:deadbeef", payload["Id"])
 	}
 }

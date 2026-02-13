@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -88,4 +89,60 @@ func imageTagLooksLikeDigest(tag string) bool {
 		}
 	}
 	return true
+}
+
+func handleImageInspect(w http.ResponseWriter, r *http.Request, stateDir string, mirrorRules []imageMirrorRule) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	raw := strings.TrimPrefix(r.URL.Path, "/images/")
+	if !strings.HasSuffix(raw, "/json") {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	raw = strings.TrimSuffix(raw, "/json")
+	raw = strings.TrimSuffix(raw, "/")
+	if raw == "" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	ref, err := url.PathUnescape(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid image name")
+		return
+	}
+	resolvedRef := rewriteImageReference(ref, mirrorRules)
+	meta, ok, err := findImageMetaByReference(stateDir, ref, resolvedRef)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "image inspect failed")
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "No such image: "+ref)
+		return
+	}
+	repoDigest := meta.Reference + "@" + meta.Digest
+	if strings.Contains(meta.Reference, "@") {
+		repoDigest = meta.Reference
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"Id":           meta.Digest,
+		"RepoTags":     []string{ref, meta.Reference},
+		"RepoDigests":  []string{repoDigest},
+		"Size":         meta.ContentSize,
+		"VirtualSize":  meta.DiskUsage,
+		"Os":           "linux",
+		"Architecture": "amd64",
+		"ContainerConfig": map[string]interface{}{
+			"Env": meta.Env,
+			"Cmd": meta.Cmd,
+		},
+		"Config": map[string]interface{}{
+			"Env":        meta.Env,
+			"Cmd":        meta.Cmd,
+			"Entrypoint": meta.Entrypoint,
+			"WorkingDir": meta.WorkingDir,
+		},
+	})
 }

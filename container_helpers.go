@@ -285,6 +285,45 @@ func listImages(stateDir string) ([]map[string]interface{}, error) {
 	return out, nil
 }
 
+func findImageMetaByReference(stateDir string, refs ...string) (imageMeta, bool, error) {
+	imageRoot := filepath.Join(stateDir, "images")
+	entries, err := os.ReadDir(imageRoot)
+	if err != nil {
+		return imageMeta{}, false, err
+	}
+	wanted := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		wanted[ref] = struct{}{}
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		metaPath := filepath.Join(imageRoot, entry.Name(), "image.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+		var meta imageMeta
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		if _, ok := wanted[meta.Reference]; ok {
+			if meta.DiskUsage == 0 {
+				if size, sizeErr := dirSize(filepath.Join(imageRoot, entry.Name(), "rootfs")); sizeErr == nil {
+					meta.DiskUsage = size
+				}
+			}
+			return meta, true, nil
+		}
+	}
+	return imageMeta{}, false, nil
+}
+
 func mergeExposedPorts(base, override map[string]struct{}) map[string]struct{} {
 	out := make(map[string]struct{})
 	for k, v := range base {
