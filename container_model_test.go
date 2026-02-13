@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -117,9 +118,11 @@ func TestHandleJSONIncludesPausedState(t *testing.T) {
 		containers: map[string]*Container{
 			"abc123": {
 				ID:      "abc123",
+				Name:    "test-db",
 				Image:   "alpine:3.20",
 				Cmd:     []string{"echo", "hej"},
 				Created: time.Now().UTC(),
+				Ports:   map[int]int{5432: 32768},
 			},
 		},
 	}
@@ -129,5 +132,22 @@ func TestHandleJSONIncludesPausedState(t *testing.T) {
 	body := rr.Body.String()
 	if !strings.Contains(body, "\"Paused\":false") {
 		t.Fatalf("inspect response missing Paused=false: %s", body)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("inspect payload invalid json: %v", err)
+	}
+	if payload["Name"] != "/test-db" {
+		t.Fatalf("inspect response Name = %#v, want /test-db", payload["Name"])
+	}
+	if _, ok := payload["HostConfig"]; !ok {
+		t.Fatalf("inspect response missing HostConfig: %s", body)
+	}
+	config, ok := payload["Config"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("inspect response Config missing or wrong type: %s", body)
+	}
+	if _, ok := config["ExposedPorts"]; !ok {
+		t.Fatalf("inspect response missing Config.ExposedPorts: %s", body)
 	}
 }

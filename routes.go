@@ -97,6 +97,13 @@ func newRouter(store *containerStore, m *metrics, cfg appConfig, probes *probeSt
 		}
 		writeJSON(w, http.StatusOK, images)
 	})
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		handleEvents(w, r)
+	})
 
 	mux.HandleFunc("/containers/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/containers/")
@@ -157,6 +164,12 @@ func newRouter(store *containerStore, m *metrics, cfg appConfig, probes *probeSt
 				return
 			}
 			handleStats(w, r, store, id)
+		case "top":
+			if r.Method != http.MethodGet {
+				writeError(w, http.StatusNotFound, "not found")
+				return
+			}
+			handleTop(w, r, store, id)
 		case "archive":
 			switch r.Method {
 			case http.MethodGet:

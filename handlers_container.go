@@ -325,11 +325,18 @@ func handleJSON(w http.ResponseWriter, r *http.Request, store *containerStore, i
 		writeError(w, http.StatusNotFound, "container not found")
 		return
 	}
+	exposed := make(map[string]struct{}, len(c.Ports))
+	for internal := range c.Ports {
+		exposed[fmt.Sprintf("%d/tcp", internal)] = struct{}{}
+	}
+	path := firstArg(c.Cmd)
+	args := restArgs(c.Cmd)
 	resp := map[string]interface{}{
 		"Id":      c.ID,
+		"Name":    containerDisplayName(c),
 		"Created": c.Created.Format(time.RFC3339Nano),
-		"Path":    firstArg(c.Cmd),
-		"Args":    restArgs(c.Cmd),
+		"Path":    path,
+		"Args":    args,
 		"State": map[string]interface{}{
 			"Status":     statusFromRunning(c.Running),
 			"Running":    c.Running,
@@ -344,17 +351,44 @@ func handleJSON(w http.ResponseWriter, r *http.Request, store *containerStore, i
 			"FinishedAt": c.Created.Format(time.RFC3339Nano),
 		},
 		"Config": map[string]interface{}{
-			"Image":    c.Image,
-			"Env":      c.Env,
-			"Cmd":      c.Cmd,
-			"Hostname": c.Hostname,
-			"User":     c.User,
+			"Hostname":     c.Hostname,
+			"User":         c.User,
+			"Image":        c.Image,
+			"Env":          c.Env,
+			"Cmd":          args,
+			"Entrypoint":   []string{path},
+			"WorkingDir":   c.WorkingDir,
+			"ExposedPorts": exposed,
 		},
+		"HostConfig": map[string]interface{}{
+			"NetworkMode":  "default",
+			"PortBindings": toDockerPorts(c.Ports),
+		},
+		"Mounts": []map[string]interface{}{},
 		"NetworkSettings": map[string]interface{}{
 			"Ports": toDockerPorts(c.Ports),
 		},
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func handleTop(w http.ResponseWriter, r *http.Request, store *containerStore, id string) {
+	c, ok := store.get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "container not found")
+		return
+	}
+	procLine := []string{"0", statusFromRunning(c.Running), strings.Join(c.Cmd, " ")}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"Titles":    []string{"PID", "STATE", "COMMAND"},
+		"Processes": [][]string{procLine},
+	})
+}
+
+func handleEvents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("[]"))
 }
 
 func handleLogs(w http.ResponseWriter, r *http.Request, store *containerStore, id string) {
