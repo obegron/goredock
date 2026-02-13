@@ -516,6 +516,20 @@ func TestUnixSocketPathFromContainerEnv(t *testing.T) {
 	}
 }
 
+func TestInsecurePullTransport(t *testing.T) {
+	rt := insecurePullTransport()
+	tr, ok := rt.(*http.Transport)
+	if !ok {
+		t.Fatalf("insecurePullTransport() returned %T, want *http.Transport", rt)
+	}
+	if tr.TLSClientConfig == nil {
+		t.Fatalf("TLSClientConfig is nil")
+	}
+	if !tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("InsecureSkipVerify = false, want true")
+	}
+}
+
 func TestIsConfluentKafkaImage(t *testing.T) {
 	tests := []struct {
 		image string

@@ -78,3 +78,29 @@ DOCKER_HOST=tcp://127.0.0.1:23750
 # Ryuk/inner clients can use:
 # DOCKER_HOST=unix:///var/run/docker.sock
 ```
+
+## Proxy + TLS Interception
+
+Image pulls happen in the `sidewhale` process. Configure proxy and trust settings on the `sidewhale` container itself.
+
+- Proxy env vars: `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`
+- Optional insecure mode for intercepted TLS: `--trust-insecure`
+
+Quick smoke test (build image first):
+
+```bash
+make image VERSION=dev IMAGE_NAME=sidewhale
+make smoke-pull IMAGE_NAME=sidewhale VERSION=dev \
+  SIDEWHALE_RUN_ARGS="--trust-insecure" \
+  SMOKE_IMAGE=redis:7-alpine
+```
+
+Example with proxy env vars:
+
+```bash
+HTTPS_PROXY=http://proxy.corp:8080 \
+HTTP_PROXY=http://proxy.corp:8080 \
+NO_PROXY=127.0.0.1,localhost \
+make smoke-pull IMAGE_NAME=sidewhale VERSION=dev \
+  SIDEWHALE_RUN_ARGS="--trust-insecure"
+```

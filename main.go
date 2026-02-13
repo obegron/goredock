@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -173,6 +174,7 @@ func main() {
 		policyFile    = flag.String("image-policy-file", "", "YAML file with allowed image prefixes")
 		imageMirrors  = flag.String("image-mirrors", "", "comma-separated image rewrite rules from=to")
 		mirrorFile    = flag.String("image-mirror-file", "", "YAML file with image rewrite rules")
+		trustInsecure = flag.Bool("trust-insecure", false, "skip TLS certificate verification for image pulls")
 		printVersion  = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -285,7 +287,7 @@ func main() {
 			writeError(w, http.StatusForbidden, "image not allowed by policy")
 			return
 		}
-		if _, _, err := ensureImage(r.Context(), resolvedRef, store.stateDir, m); err != nil {
+		if _, _, err := ensureImage(r.Context(), resolvedRef, store.stateDir, m, *trustInsecure); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -307,7 +309,7 @@ func main() {
 	mux.HandleFunc("/containers/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/containers/")
 		if path == "create" && r.Method == http.MethodPost {
-			handleCreate(w, r, store, allowedPrefixes, mirrorRules, unixSocketPath)
+			handleCreate(w, r, store, allowedPrefixes, mirrorRules, unixSocketPath, *trustInsecure)
 			return
 		}
 		parts := strings.Split(path, "/")
@@ -689,7 +691,7 @@ func isAPIVersion(v string) bool {
 	return true
 }
 
-func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore, allowedPrefixes []string, mirrorRules []imageMirrorRule, unixSocketPath string) {
+func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore, allowedPrefixes []string, mirrorRules []imageMirrorRule, unixSocketPath string, trustInsecure bool) {
 	var req createRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -710,7 +712,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 		return
 	}
 
-	imageRootfs, meta, err := ensureImage(r.Context(), resolvedRef, store.stateDir, nil)
+	imageRootfs, meta, err := ensureImage(r.Context(), resolvedRef, store.stateDir, nil, trustInsecure)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -3282,16 +3284,23 @@ func mergeExposedPorts(base, override map[string]struct{}) map[string]struct{} {
 	return out
 }
 
-func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (string, imageMeta, error) {
+func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics, trustInsecure bool) (string, imageMeta, error) {
 	ref = strings.TrimSpace(ref)
 	parsed, err := name.ParseReference(ref)
 	if err != nil {
 		return "", imageMeta{}, fmt.Errorf("invalid image reference: %w", err)
 	}
-	image, err := remote.Image(parsed, remote.WithContext(ctx), remote.WithPlatform(v1.Platform{
-		OS:           "linux",
-		Architecture: "amd64",
-	}))
+	remoteOptions := []remote.Option{
+		remote.WithContext(ctx),
+		remote.WithPlatform(v1.Platform{
+			OS:           "linux",
+			Architecture: "amd64",
+		}),
+	}
+	if trustInsecure {
+		remoteOptions = append(remoteOptions, remote.WithTransport(insecurePullTransport()))
+	}
+	image, err := remote.Image(parsed, remoteOptions...)
 	if err != nil {
 		return "", imageMeta{}, fmt.Errorf("image pull failed: %w", err)
 	}
@@ -3383,6 +3392,24 @@ func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (
 		m.mu.Unlock()
 	}
 	return rootfsDir, meta, nil
+}
+
+func insecurePullTransport() http.RoundTripper {
+	base, _ := http.DefaultTransport.(*http.Transport)
+	if base == nil {
+		return &http.Transport{
+			Proxy:           http.ProxyFromEnvironment,
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // explicitly enabled by --trust-insecure
+		}
+	}
+	transport := base.Clone()
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{} //nolint:gosec // explicit opt-in below
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	}
+	transport.TLSClientConfig.InsecureSkipVerify = true //nolint:gosec // explicitly enabled by --trust-insecure
+	return transport
 }
 
 func dirSize(root string) (int64, error) {
