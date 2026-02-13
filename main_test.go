@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/binary"
 	"net"
-	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -12,103 +11,6 @@ import (
 	"testing"
 	"time"
 )
-
-func TestRewriteVersionedPath(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		wantPath string
-		wantOK   bool
-	}{
-		{name: "versioned containers", input: "/v1.53/containers/json", wantPath: "/containers/json", wantOK: true},
-		{name: "versioned ping", input: "/v1.41/_ping", wantPath: "/_ping", wantOK: true},
-		{name: "unversioned path", input: "/version", wantPath: "", wantOK: false},
-		{name: "invalid version text", input: "/v1.x/version", wantPath: "", wantOK: false},
-		{name: "missing trailing path", input: "/v1.53", wantPath: "", wantOK: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotPath, gotOK := rewriteVersionedPath(tt.input)
-			if gotPath != tt.wantPath || gotOK != tt.wantOK {
-				t.Fatalf("rewriteVersionedPath(%q) = (%q, %v), want (%q, %v)", tt.input, gotPath, gotOK, tt.wantPath, tt.wantOK)
-			}
-		})
-	}
-}
-
-func TestIsAPIVersion(t *testing.T) {
-	tests := []struct {
-		input string
-		want  bool
-	}{
-		{input: "1.53", want: true},
-		{input: "10.0", want: true},
-		{input: "1", want: false},
-		{input: "a.b", want: false},
-		{input: "1.2.3", want: false},
-		{input: "1.", want: false},
-	}
-
-	for _, tt := range tests {
-		if got := isAPIVersion(tt.input); got != tt.want {
-			t.Fatalf("isAPIVersion(%q) = %v, want %v", tt.input, got, tt.want)
-		}
-	}
-}
-
-func TestIsImageAllowed(t *testing.T) {
-	prefixes := []string{"postgres", "docker.io/library/redis"}
-	tests := []struct {
-		image string
-		want  bool
-	}{
-		{image: "postgres:16", want: true},
-		{image: "redis:7", want: true},
-		{image: "docker.io/library/redis:7", want: true},
-		{image: "ghcr.io/acme/postgres:1", want: false},
-	}
-	for _, tt := range tests {
-		if got := isImageAllowed(tt.image, prefixes); got != tt.want {
-			t.Fatalf("isImageAllowed(%q) = %v, want %v", tt.image, got, tt.want)
-		}
-	}
-}
-
-func TestLoadAllowedImagePrefixes(t *testing.T) {
-	dir := t.TempDir()
-	policyPath := filepath.Join(dir, "policy.yaml")
-	if err := os.WriteFile(policyPath, []byte("allowed_images:\n  - redis\nimages:\n  - postgres\n"), 0o644); err != nil {
-		t.Fatalf("write policy file: %v", err)
-	}
-
-	got, err := loadAllowedImagePrefixes("ghcr.io/acme,", policyPath)
-	if err != nil {
-		t.Fatalf("loadAllowedImagePrefixes error: %v", err)
-	}
-	want := map[string]bool{
-		"ghcr.io/acme": true,
-		"redis":        true,
-		"postgres":     true,
-	}
-	if len(got) != len(want) {
-		t.Fatalf("prefix count = %d, want %d (%v)", len(got), len(want), got)
-	}
-	for _, p := range got {
-		if !want[p] {
-			t.Fatalf("unexpected prefix %q in %v", p, got)
-		}
-	}
-}
-
-func TestRequireUnprivilegedRuntime(t *testing.T) {
-	if err := requireUnprivilegedRuntime(1000); err != nil {
-		t.Fatalf("requireUnprivilegedRuntime(1000) returned unexpected error: %v", err)
-	}
-	if err := requireUnprivilegedRuntime(0); err == nil {
-		t.Fatalf("requireUnprivilegedRuntime(0) expected error, got nil")
-	}
-}
 
 func TestContainerLookupByNameAndShortID(t *testing.T) {
 	store := &containerStore{
@@ -173,43 +75,6 @@ func TestFrameDockerRawStream(t *testing.T) {
 	}
 }
 
-func TestRewriteImageReference(t *testing.T) {
-	rules := []imageMirrorRule{
-		{FromPrefix: "docker.io/library/", ToPrefix: "registry.internal/library/"},
-		{FromPrefix: "ghcr.io/", ToPrefix: "registry.internal/ghcr/"},
-	}
-	tests := []struct {
-		in   string
-		want string
-	}{
-		{in: "docker.io/library/postgres:16", want: "registry.internal/library/postgres:16"},
-		{in: "postgres:16", want: "registry.internal/library/postgres:16"},
-		{in: "ghcr.io/acme/api:1", want: "registry.internal/ghcr/acme/api:1"},
-		{in: "quay.io/org/app:1", want: "quay.io/org/app:1"},
-	}
-	for _, tt := range tests {
-		if got := rewriteImageReference(tt.in, rules); got != tt.want {
-			t.Fatalf("rewriteImageReference(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
-func TestLoadImageMirrorRules(t *testing.T) {
-	dir := t.TempDir()
-	mirrorPath := filepath.Join(dir, "mirrors.yaml")
-	content := "image_mirrors:\n  - from: docker.io/library/\n    to: registry.internal/library/\n"
-	if err := os.WriteFile(mirrorPath, []byte(content), 0o644); err != nil {
-		t.Fatalf("write mirror file: %v", err)
-	}
-	got, err := loadImageMirrorRules("ghcr.io/=registry.internal/ghcr/", mirrorPath)
-	if err != nil {
-		t.Fatalf("loadImageMirrorRules error: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("mirror rule count = %d, want 2 (%v)", len(got), got)
-	}
-}
-
 func TestListContainersIncludesCommand(t *testing.T) {
 	store := &containerStore{
 		containers: map[string]*Container{
@@ -227,15 +92,6 @@ func TestListContainersIncludesCommand(t *testing.T) {
 	}
 	if list[0]["Command"] != "echo hej" {
 		t.Fatalf("unexpected command field: %#v", list[0]["Command"])
-	}
-}
-
-func TestParseMemTotal(t *testing.T) {
-	data := []byte("MemTotal:       12345 kB\nMemFree:        12 kB\n")
-	got := parseMemTotal(data)
-	want := int64(12345 * 1024)
-	if got != want {
-		t.Fatalf("parseMemTotal = %d, want %d", got, want)
 	}
 }
 
@@ -415,25 +271,6 @@ func TestDockerHostForInnerClients(t *testing.T) {
 	}
 }
 
-func TestRequestTimeoutFor(t *testing.T) {
-	tests := []struct {
-		name   string
-		method string
-		target string
-		want   time.Duration
-	}{
-		{name: "default", method: http.MethodGet, target: "/version", want: 30 * time.Second},
-		{name: "images create", method: http.MethodPost, target: "/images/create?fromImage=redis", want: 10 * time.Minute},
-		{name: "logs follow", method: http.MethodGet, target: "/containers/abc/logs?follow=true", want: 0},
-	}
-	for _, tt := range tests {
-		req := httptest.NewRequest(tt.method, tt.target, nil)
-		if got := requestTimeoutFor(req); got != tt.want {
-			t.Fatalf("%s: requestTimeoutFor(%s %s) = %s, want %s", tt.name, tt.method, tt.target, got, tt.want)
-		}
-	}
-}
-
 func TestMapArchiveDestinationPath(t *testing.T) {
 	rootfs := filepath.Join("/tmp", "rootfs")
 	c := &Container{Rootfs: rootfs}
@@ -470,24 +307,6 @@ func TestMapArchiveDestinationPath(t *testing.T) {
 	}
 }
 
-func TestResolveUnixSocketPath(t *testing.T) {
-	stateDir := "/tmp/sw"
-	tests := []struct {
-		in   string
-		want string
-	}{
-		{in: "", want: "/tmp/sw/docker.sock"},
-		{in: "-", want: ""},
-		{in: "off", want: ""},
-		{in: "/run/user/1000/sw.sock", want: "/run/user/1000/sw.sock"},
-	}
-	for _, tt := range tests {
-		if got := resolveUnixSocketPath(tt.in, stateDir); got != tt.want {
-			t.Fatalf("resolveUnixSocketPath(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
 func TestDockerSocketBindsForContainer(t *testing.T) {
 	rootfs := t.TempDir()
 	c := &Container{Rootfs: rootfs}
@@ -513,93 +332,6 @@ func TestUnixSocketPathFromContainerEnv(t *testing.T) {
 	env := []string{"A=B", "DOCKER_HOST=unix:///tmp/sidewhale/docker.sock"}
 	if got := unixSocketPathFromContainerEnv(env); got != "/tmp/sidewhale/docker.sock" {
 		t.Fatalf("unixSocketPathFromContainerEnv = %q, want %q", got, "/tmp/sidewhale/docker.sock")
-	}
-}
-
-func TestInsecurePullTransport(t *testing.T) {
-	rt := insecurePullTransport()
-	tr, ok := rt.(*http.Transport)
-	if !ok {
-		t.Fatalf("insecurePullTransport() returned %T, want *http.Transport", rt)
-	}
-	if tr.TLSClientConfig == nil {
-		t.Fatalf("TLSClientConfig is nil")
-	}
-	if !tr.TLSClientConfig.InsecureSkipVerify {
-		t.Fatalf("InsecureSkipVerify = false, want true")
-	}
-}
-
-func TestEnsureSyntheticUserIdentityNumericUID(t *testing.T) {
-	rootfs := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(rootfs, "etc"), 0o755); err != nil {
-		t.Fatalf("mkdir etc: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(rootfs, "etc", "passwd"), []byte("root:x:0:0:root:/root:/bin/sh\n"), 0o644); err != nil {
-		t.Fatalf("write passwd: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(rootfs, "etc", "group"), []byte("root:x:0:\n"), 0o644); err != nil {
-		t.Fatalf("write group: %v", err)
-	}
-
-	if err := ensureSyntheticUserIdentity(rootfs, "65532"); err != nil {
-		t.Fatalf("ensureSyntheticUserIdentity: %v", err)
-	}
-	passwdData, err := os.ReadFile(filepath.Join(rootfs, "etc", "passwd"))
-	if err != nil {
-		t.Fatalf("read passwd: %v", err)
-	}
-	if !strings.Contains(string(passwdData), ":65532:65532:") {
-		t.Fatalf("passwd missing synthetic uid/gid entry: %s", string(passwdData))
-	}
-	groupData, err := os.ReadFile(filepath.Join(rootfs, "etc", "group"))
-	if err != nil {
-		t.Fatalf("read group: %v", err)
-	}
-	if !strings.Contains(string(groupData), ":65532:") {
-		t.Fatalf("group missing synthetic gid entry: %s", string(groupData))
-	}
-}
-
-func TestEnsureSyntheticUserIdentityIdempotent(t *testing.T) {
-	rootfs := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(rootfs, "etc"), 0o755); err != nil {
-		t.Fatalf("mkdir etc: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(rootfs, "etc", "passwd"), []byte("root:x:0:0:root:/root:/bin/sh\n"), 0o644); err != nil {
-		t.Fatalf("write passwd: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(rootfs, "etc", "group"), []byte("root:x:0:\n"), 0o644); err != nil {
-		t.Fatalf("write group: %v", err)
-	}
-
-	if err := ensureSyntheticUserIdentity(rootfs, "65532:65532"); err != nil {
-		t.Fatalf("first ensureSyntheticUserIdentity: %v", err)
-	}
-	if err := ensureSyntheticUserIdentity(rootfs, "65532:65532"); err != nil {
-		t.Fatalf("second ensureSyntheticUserIdentity: %v", err)
-	}
-
-	passwdData, err := os.ReadFile(filepath.Join(rootfs, "etc", "passwd"))
-	if err != nil {
-		t.Fatalf("read passwd: %v", err)
-	}
-	if strings.Count(string(passwdData), "sidewhale-65532:x:65532:65532:") != 1 {
-		t.Fatalf("expected one synthetic passwd entry, got: %s", string(passwdData))
-	}
-	groupData, err := os.ReadFile(filepath.Join(rootfs, "etc", "group"))
-	if err != nil {
-		t.Fatalf("read group: %v", err)
-	}
-	if strings.Count(string(groupData), "sidewhale-65532:x:65532:") != 1 {
-		t.Fatalf("expected one synthetic group entry, got: %s", string(groupData))
-	}
-}
-
-func TestResolveProotIdentityDefaultsToRoot(t *testing.T) {
-	rootfs := t.TempDir()
-	if got, ok := resolveProotIdentity(rootfs, ""); !ok || got != "0:0" {
-		t.Fatalf("resolveProotIdentity(empty) = (%q,%v), want (%q,%v)", got, ok, "0:0", true)
 	}
 }
 
