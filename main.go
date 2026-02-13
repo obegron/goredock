@@ -19,6 +19,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -116,6 +117,7 @@ type imageMeta struct {
 	Env          []string            `json:"Env"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 	WorkingDir   string              `json:"WorkingDir"`
+	User         string              `json:"User,omitempty"`
 	Extractor    string              `json:"Extractor,omitempty"`
 }
 
@@ -422,12 +424,20 @@ func timeoutMiddleware(next http.Handler) http.Handler {
 }
 
 func requestTimeoutFor(r *http.Request) time.Duration {
+	path := r.URL.Path
+	if rewritten, ok := rewriteVersionedPath(path); ok {
+		path = rewritten
+	}
 	// Image pulls can take much longer than normal control-plane calls.
-	if r.Method == http.MethodPost && r.URL.Path == "/images/create" {
+	if r.Method == http.MethodPost && path == "/images/create" {
+		return 10 * time.Minute
+	}
+	// Rootfs clone for large images can also take longer than default.
+	if r.Method == http.MethodPost && path == "/containers/create" {
 		return 10 * time.Minute
 	}
 	// Docker clients may keep log follow streams open for long periods.
-	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/logs") && parseDockerBool(r.URL.Query().Get("follow"), false) {
+	if r.Method == http.MethodGet && strings.HasSuffix(path, "/logs") && parseDockerBool(r.URL.Query().Get("follow"), false) {
 		return 0
 	}
 	return 30 * time.Second
@@ -1249,7 +1259,20 @@ func resolveCommandInRootfs(rootfs string, env []string, cmdArgs []string) []str
 	if resolved, ok := resolveBinaryPathInRootfs(rootfs, env, adjusted[0]); ok {
 		adjusted[0] = resolved
 	}
-	return rewriteShebangCommand(rootfs, env, adjusted)
+	adjusted = rewriteShebangCommand(rootfs, env, adjusted)
+	return rewriteKnownEntrypointCompat(adjusted)
+}
+
+func rewriteKnownEntrypointCompat(cmdArgs []string) []string {
+	if len(cmdArgs) >= 3 && strings.HasSuffix(cmdArgs[0], "/bash") && strings.HasSuffix(cmdArgs[1], "/opt/mssql/bin/launch_sqlservr.sh") {
+		// In proot 5.1.0, bash `test -x` inside launch_sqlservr.sh can fail with false ENOENT.
+		// Running sqlservr directly avoids this check and starts successfully.
+		return append([]string{cmdArgs[2]}, cmdArgs[3:]...)
+	}
+	if len(cmdArgs) >= 2 && strings.HasSuffix(cmdArgs[0], "/opt/mssql/bin/launch_sqlservr.sh") {
+		return append([]string{cmdArgs[1]}, cmdArgs[2:]...)
+	}
+	return cmdArgs
 }
 
 func resolveBinaryPathInRootfs(rootfs string, env []string, cmd string) (string, bool) {
@@ -2075,11 +2098,16 @@ func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (
 	if err != nil {
 		return "", imageMeta{}, fmt.Errorf("layer list failed: %w", err)
 	}
+	dirModes := map[string]dirAttributes{}
 	for _, layer := range layers {
-		if err := extractLayer(tmpRootfs, layer); err != nil {
+		if err := extractLayer(tmpRootfs, layer, dirModes); err != nil {
 			_ = os.RemoveAll(tmpRootfs)
 			return "", imageMeta{}, err
 		}
+	}
+	if err := applyDirModes(dirModes); err != nil {
+		_ = os.RemoveAll(tmpRootfs)
+		return "", imageMeta{}, err
 	}
 	if err := os.Rename(tmpRootfs, rootfsDir); err != nil {
 		_ = os.RemoveAll(tmpRootfs)
@@ -2097,6 +2125,7 @@ func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (
 		meta.Env = cfg.Config.Env
 		meta.ExposedPorts = cfg.Config.ExposedPorts
 		meta.WorkingDir = cfg.Config.WorkingDir
+		meta.User = cfg.Config.User
 	}
 	if data, err := json.MarshalIndent(meta, "", "  "); err == nil {
 		_ = os.WriteFile(metaPath, data, 0o644)
@@ -2110,7 +2139,12 @@ func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (
 	return rootfsDir, meta, nil
 }
 
-func extractLayer(rootfs string, layer v1.Layer) error {
+type dirAttributes struct {
+	mode    fs.FileMode
+	modTime time.Time
+}
+
+func extractLayer(rootfs string, layer v1.Layer, dirModes map[string]dirAttributes) error {
 	rc, err := layer.Uncompressed()
 	if err != nil {
 		return fmt.Errorf("layer read failed: %w", err)
@@ -2153,9 +2187,10 @@ func extractLayer(rootfs string, layer v1.Layer) error {
 
 		switch h.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(targetPath, fs.FileMode(h.Mode)); err != nil {
+			if err := os.MkdirAll(targetPath, 0o755); err != nil {
 				return fmt.Errorf("mkdir failed: %w", err)
 			}
+			dirModes[targetPath] = dirAttributes{mode: fs.FileMode(h.Mode), modTime: h.ModTime}
 		case tar.TypeReg, tar.TypeRegA:
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 				return fmt.Errorf("parent mkdir failed: %w", err)
@@ -2213,6 +2248,25 @@ func extractLayer(rootfs string, layer v1.Layer) error {
 	}
 }
 
+func applyDirModes(dirModes map[string]dirAttributes) error {
+	paths := make([]string, 0, len(dirModes))
+	for path := range dirModes {
+		paths = append(paths, path)
+	}
+	// Apply deeper directories first so parent mode tightening does not block children updates.
+	sort.Slice(paths, func(i, j int) bool {
+		return strings.Count(paths[i], string(os.PathSeparator)) > strings.Count(paths[j], string(os.PathSeparator))
+	})
+	for _, path := range paths {
+		attr := dirModes[path]
+		if err := os.Chmod(path, attr.mode); err != nil {
+			return fmt.Errorf("dir chmod failed: %w", err)
+		}
+		_ = os.Chtimes(path, time.Now(), attr.modTime)
+	}
+	return nil
+}
+
 func normalizeLayerPath(name string) (string, bool) {
 	raw := strings.TrimSpace(name)
 	if raw == "" {
@@ -2245,7 +2299,14 @@ func removeAllChildren(dir string) error {
 }
 
 func copyDir(src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+	type copiedDir struct {
+		path    string
+		mode    fs.FileMode
+		modTime time.Time
+	}
+	var dirs []copiedDir
+
+	if err := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -2262,7 +2323,11 @@ func copyDir(src, dst string) error {
 			return err
 		}
 		if d.IsDir() {
-			return os.MkdirAll(target, info.Mode())
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			dirs = append(dirs, copiedDir{path: target, mode: info.Mode(), modTime: info.ModTime()})
+			return nil
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			link, err := os.Readlink(path)
@@ -2276,26 +2341,43 @@ func copyDir(src, dst string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			srcFile, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			// Use a closure or explicit Close to avoid leaking descriptors in WalkDir
-			err = func() error {
-				defer srcFile.Close()
-				dstFile, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
-				if err != nil {
-					return err
+			_ = os.RemoveAll(target)
+			if err := os.Link(path, target); err != nil {
+				srcFile, openErr := os.Open(path)
+				if openErr != nil {
+					return openErr
 				}
-				defer dstFile.Close()
-				_, err = io.Copy(dstFile, srcFile)
-				return err
-			}()
-			if err != nil {
-				return err
+				// Use a closure or explicit Close to avoid leaking descriptors in WalkDir
+				copyErr := func() error {
+					defer srcFile.Close()
+					dstFile, createErr := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+					if createErr != nil {
+						return createErr
+					}
+					defer dstFile.Close()
+					_, ioErr := io.Copy(dstFile, srcFile)
+					return ioErr
+				}()
+				if copyErr != nil {
+					return copyErr
+				}
 			}
+			_ = os.Chtimes(target, time.Now(), info.ModTime())
 			return nil
 		}
 		return nil
+	}); err != nil {
+		return err
+	}
+
+	sort.Slice(dirs, func(i, j int) bool {
+		return strings.Count(dirs[i].path, string(os.PathSeparator)) > strings.Count(dirs[j].path, string(os.PathSeparator))
 	})
+	for _, d := range dirs {
+		if err := os.Chmod(d.path, d.mode); err != nil {
+			return err
+		}
+		_ = os.Chtimes(d.path, time.Now(), d.modTime)
+	}
+	return nil
 }

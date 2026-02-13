@@ -284,6 +284,14 @@ func TestResolveCommandInRootfsRewritesEnvShebang(t *testing.T) {
 	}
 }
 
+func TestRewriteKnownEntrypointCompatMSSQL(t *testing.T) {
+	got := rewriteKnownEntrypointCompat([]string{"/bin/bash", "/opt/mssql/bin/launch_sqlservr.sh", "/opt/mssql/bin/sqlservr"})
+	want := []string{"/opt/mssql/bin/sqlservr"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("rewriteKnownEntrypointCompat returned %v, want %v", got, want)
+	}
+}
+
 func TestHandleJSONIncludesPausedState(t *testing.T) {
 	store := &containerStore{
 		containers: map[string]*Container{
