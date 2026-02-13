@@ -292,6 +292,55 @@ func TestRewriteKnownEntrypointCompatMSSQL(t *testing.T) {
 	}
 }
 
+func TestNormalizeContainerHostname(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "", want: ""},
+		{in: " db_1 ", want: "db-1"},
+		{in: "alpha.beta", want: "alpha.beta"},
+		{in: "!!!", want: ""},
+	}
+	for _, tt := range tests {
+		if got := normalizeContainerHostname(tt.in); got != tt.want {
+			t.Fatalf("normalizeContainerHostname(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestWriteContainerIdentityFiles(t *testing.T) {
+	rootfs := t.TempDir()
+	if err := writeContainerIdentityFiles(rootfs, "tc-host"); err != nil {
+		t.Fatalf("writeContainerIdentityFiles error: %v", err)
+	}
+	hostnameData, err := os.ReadFile(filepath.Join(rootfs, "etc", "hostname"))
+	if err != nil {
+		t.Fatalf("read hostname: %v", err)
+	}
+	if string(hostnameData) != "tc-host\n" {
+		t.Fatalf("hostname content = %q, want %q", string(hostnameData), "tc-host\n")
+	}
+	hostsData, err := os.ReadFile(filepath.Join(rootfs, "etc", "hosts"))
+	if err != nil {
+		t.Fatalf("read hosts: %v", err)
+	}
+	hosts := string(hostsData)
+	if !strings.Contains(hosts, "127.0.1.1\ttc-host") {
+		t.Fatalf("hosts missing hostname mapping: %q", hosts)
+	}
+	if err := writeContainerIdentityFiles(rootfs, "tc-host"); err != nil {
+		t.Fatalf("writeContainerIdentityFiles second call error: %v", err)
+	}
+	hostsData2, err := os.ReadFile(filepath.Join(rootfs, "etc", "hosts"))
+	if err != nil {
+		t.Fatalf("read hosts after second call: %v", err)
+	}
+	if strings.Count(string(hostsData2), "tc-host") != 1 {
+		t.Fatalf("expected single hostname entry, got: %q", string(hostsData2))
+	}
+}
+
 func TestHandleJSONIncludesPausedState(t *testing.T) {
 	store := &containerStore{
 		containers: map[string]*Container{

@@ -35,6 +35,7 @@ import (
 type Container struct {
 	ID         string    `json:"Id"`
 	Name       string    `json:"Name,omitempty"`
+	Hostname   string    `json:"Hostname,omitempty"`
 	Image      string    `json:"Image"`
 	Rootfs     string    `json:"Rootfs"`
 	Created    time.Time `json:"Created"`
@@ -74,6 +75,7 @@ type metrics struct {
 
 type createRequest struct {
 	Image        string              `json:"Image"`
+	Hostname     string              `json:"Hostname"`
 	Cmd          []string            `json:"Cmd"`
 	Env          []string            `json:"Env"`
 	Entrypoint   []string            `json:"Entrypoint"`
@@ -597,6 +599,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 		writeError(w, http.StatusInternalServerError, "id generation failed")
 		return
 	}
+	hostname := normalizeContainerHostname(req.Hostname)
+	if hostname == "" {
+		hostname = defaultContainerHostname(id)
+	}
 
 	rootfs := filepath.Join(store.stateDir, "containers", id, "rootfs")
 	if err := os.MkdirAll(rootfs, 0o755); err != nil {
@@ -605,6 +611,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 	}
 	if err := copyDir(imageRootfs, rootfs); err != nil {
 		writeError(w, http.StatusInternalServerError, "rootfs copy failed")
+		return
+	}
+	if err := writeContainerIdentityFiles(rootfs, hostname); err != nil {
+		writeError(w, http.StatusInternalServerError, "hostname setup failed")
 		return
 	}
 	logPath := filepath.Join(store.stateDir, "containers", id, "container.log")
@@ -623,6 +633,14 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 	}
 
 	env := mergeEnv(meta.Env, req.Env)
+	if !envHasKey(env, "HOSTNAME") && hostname != "" {
+		env = append(env, "HOSTNAME="+hostname)
+	}
+	if isRabbitMQImage(resolvedRef) || isRabbitMQImage(req.Image) {
+		if !envHasKey(env, "RABBITMQ_NODENAME") {
+			env = append(env, "RABBITMQ_NODENAME=rabbit@"+hostname)
+		}
+	}
 	if isRyukImage(resolvedRef) || isRyukImage(req.Image) {
 		env = mergeEnv(env, []string{"DOCKER_HOST=" + dockerHostForInnerClients(r.Host)})
 	}
@@ -644,6 +662,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 	c := &Container{
 		ID:         id,
 		Name:       name,
+		Hostname:   hostname,
 		Image:      req.Image,
 		Rootfs:     rootfs,
 		Created:    time.Now().UTC(),
@@ -872,9 +891,10 @@ func handleJSON(w http.ResponseWriter, r *http.Request, store *containerStore, i
 			"FinishedAt": c.Created.Format(time.RFC3339Nano),
 		},
 		"Config": map[string]interface{}{
-			"Image": c.Image,
-			"Env":   c.Env,
-			"Cmd":   c.Cmd,
+			"Image":    c.Image,
+			"Env":      c.Env,
+			"Cmd":      c.Cmd,
+			"Hostname": c.Hostname,
 		},
 		"NetworkSettings": map[string]interface{}{
 			"Ports": toDockerPorts(c.Ports),
@@ -1842,7 +1862,7 @@ func (p *portProxy) stopProxy() {
 
 func proxyConn(src net.Conn, containerPort int) {
 	defer src.Close()
-	dst, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(containerPort))
+	dst, err := dialContainerPort(containerPort)
 	if err != nil {
 		return
 	}
@@ -1853,6 +1873,26 @@ func proxyConn(src net.Conn, containerPort int) {
 	}()
 	_, _ = io.Copy(src, dst)
 	_ = src.(*net.TCPConn).CloseWrite()
+}
+
+func dialContainerPort(containerPort int) (net.Conn, error) {
+	port := strconv.Itoa(containerPort)
+	endpoints := []string{
+		"127.0.0.1:" + port,
+		"[::1]:" + port,
+	}
+	var lastErr error
+	for _, ep := range endpoints {
+		conn, err := net.DialTimeout("tcp", ep, 2*time.Second)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no endpoint candidates")
+	}
+	return nil, lastErr
 }
 
 func monitorContainer(id string, pid int, logPath string, store *containerStore, limits runtimeLimits) {
@@ -1977,6 +2017,16 @@ func splitEnv(env string) (string, string) {
 	return parts[0], parts[1]
 }
 
+func envHasKey(env []string, key string) bool {
+	for _, e := range env {
+		k, _ := splitEnv(e)
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
 func deduplicateEnv(env []string) []string {
 	out := make([]string, 0, len(env))
 	seen := map[string]int{}
@@ -1995,10 +2045,97 @@ func deduplicateEnv(env []string) []string {
 	return out
 }
 
+func defaultContainerHostname(id string) string {
+	if len(id) >= 12 {
+		return id[:12]
+	}
+	return id
+}
+
+func normalizeContainerHostname(hostname string) string {
+	h := strings.TrimSpace(hostname)
+	if h == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range h {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		case r == '-' || r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-.")
+	if out == "" {
+		return ""
+	}
+	return out
+}
+
+func writeContainerIdentityFiles(rootfs, hostname string) error {
+	if strings.TrimSpace(hostname) == "" {
+		return nil
+	}
+	etcDir := filepath.Join(rootfs, "etc")
+	if err := os.MkdirAll(etcDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(etcDir, "hostname"), []byte(hostname+"\n"), 0o644); err != nil {
+		return err
+	}
+	hostsPath := filepath.Join(etcDir, "hosts")
+	current, _ := os.ReadFile(hostsPath)
+	if hostsFileHasHostname(current, hostname) {
+		return nil
+	}
+	var content strings.Builder
+	if len(current) == 0 {
+		content.WriteString("127.0.0.1\tlocalhost\n")
+		content.WriteString("::1\tlocalhost ip6-localhost ip6-loopback\n")
+	} else {
+		content.Write(current)
+		if len(current) > 0 && current[len(current)-1] != '\n' {
+			content.WriteByte('\n')
+		}
+	}
+	content.WriteString("127.0.1.1\t")
+	content.WriteString(hostname)
+	content.WriteByte('\n')
+	return os.WriteFile(hostsPath, []byte(content.String()), 0o644)
+}
+
+func hostsFileHasHostname(data []byte, hostname string) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		for _, f := range fields[1:] {
+			if f == hostname {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func isRyukImage(image string) bool {
 	norm := strings.ToLower(strings.TrimSpace(image))
 	norm = strings.TrimPrefix(norm, "docker.io/")
 	return strings.Contains(norm, "testcontainers/ryuk")
+}
+
+func isRabbitMQImage(image string) bool {
+	norm := strings.ToLower(strings.TrimSpace(image))
+	norm = strings.TrimPrefix(norm, "docker.io/")
+	return strings.Contains(norm, "rabbitmq")
 }
 
 func dockerHostForInnerClients(requestHost string) string {
@@ -2195,6 +2332,9 @@ func extractLayer(rootfs string, layer v1.Layer, dirModes map[string]dirAttribut
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 				return fmt.Errorf("parent mkdir failed: %w", err)
 			}
+			// Layer entries can replace an existing non-writable file from previous layers.
+			// Remove first so create does not fail with EACCES on truncate/open.
+			_ = os.RemoveAll(targetPath)
 			f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fs.FileMode(h.Mode))
 			if err != nil {
 				return fmt.Errorf("file create failed: %w", err)
@@ -2260,6 +2400,10 @@ func applyDirModes(dirModes map[string]dirAttributes) error {
 	for _, path := range paths {
 		attr := dirModes[path]
 		if err := os.Chmod(path, attr.mode); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				// Whiteouts in later layers can remove directories recorded earlier.
+				continue
+			}
 			return fmt.Errorf("dir chmod failed: %w", err)
 		}
 		_ = os.Chtimes(path, time.Now(), attr.modTime)
