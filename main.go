@@ -163,6 +163,7 @@ const extractorVersion = "v2"
 func main() {
 	var (
 		listenAddr    = flag.String("listen", ":23750", "listen address")
+		listenUnix    = flag.String("listen-unix", "", "unix socket path (empty = <state-dir>/docker.sock, '-' disables)")
 		stateDir      = flag.String("state-dir", "/tmp/sidewhale", "state directory")
 		maxConcurrent = flag.Int("max-concurrent", 4, "max concurrent containers (0 = unlimited)")
 		maxRuntime    = flag.Duration("max-runtime", 30*time.Minute, "max runtime per container (0 = unlimited)")
@@ -191,6 +192,7 @@ func main() {
 		stateDir:   *stateDir,
 		proxies:    make(map[string][]*portProxy),
 	}
+	unixSocketPath := resolveUnixSocketPath(*listenUnix, *stateDir)
 	allowedPrefixes, err := loadAllowedImagePrefixes(*allowedImages, *policyFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "image policy load failed: %v\n", err)
@@ -305,7 +307,7 @@ func main() {
 	mux.HandleFunc("/containers/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/containers/")
 		if path == "create" && r.Method == http.MethodPost {
-			handleCreate(w, r, store, allowedPrefixes, mirrorRules)
+			handleCreate(w, r, store, allowedPrefixes, mirrorRules, unixSocketPath)
 			return
 		}
 		parts := strings.Split(path, "/")
@@ -435,11 +437,82 @@ func main() {
 		IdleTimeout: 5 * time.Minute,
 	}
 
-	fmt.Printf("sidewhale listening on %s\n", *listenAddr)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	errCh := make(chan error, 2)
+	started := 0
+
+	tcpAddr := strings.TrimSpace(*listenAddr)
+	if tcpAddr != "" && !strings.EqualFold(tcpAddr, "off") && tcpAddr != "-" {
+		started++
+		go func() {
+			fmt.Printf("sidewhale listening on %s\n", tcpAddr)
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+	}
+
+	if unixSocketPath != "" {
+		ln, err := listenUnixSocket(unixSocketPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "unix socket setup failed: %v\n", err)
+			os.Exit(1)
+		}
+		started++
+		go func() {
+			fmt.Printf("sidewhale listening on unix://%s\n", unixSocketPath)
+			if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+	}
+
+	if started == 0 {
+		fmt.Fprintln(os.Stderr, "no listeners configured")
+		os.Exit(1)
+	}
+	if err := <-errCh; err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func resolveUnixSocketPath(raw, stateDir string) string {
+	val := strings.TrimSpace(raw)
+	switch strings.ToLower(val) {
+	case "-", "off", "none", "disabled":
+		return ""
+	case "":
+		return filepath.Join(stateDir, "docker.sock")
+	default:
+		return val
+	}
+}
+
+func listenUnixSocket(socketPath string) (net.Listener, error) {
+	dir := filepath.Dir(socketPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	if info, err := os.Lstat(socketPath); err == nil {
+		if info.Mode().Type() == fs.ModeSocket || info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			if rmErr := os.Remove(socketPath); rmErr != nil {
+				return nil, rmErr
+			}
+		} else {
+			return nil, fmt.Errorf("path exists and is not a socket: %s", socketPath)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return nil, err
+	}
+	if chmodErr := os.Chmod(socketPath, 0o666); chmodErr != nil {
+		ln.Close()
+		return nil, chmodErr
+	}
+	return ln, nil
 }
 
 func timeoutMiddleware(next http.Handler) http.Handler {
@@ -486,7 +559,7 @@ func requireUnprivilegedRuntime(euid int) error {
 	return nil
 }
 
-func buildContainerCommand(rootfs, tmpBind, workingDir, userSpec string, cmdArgs []string) (*exec.Cmd, error) {
+func buildContainerCommand(rootfs, tmpBind, workingDir, userSpec string, extraBinds []string, cmdArgs []string) (*exec.Cmd, error) {
 	if len(cmdArgs) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
@@ -510,6 +583,13 @@ func buildContainerCommand(rootfs, tmpBind, workingDir, userSpec string, cmdArgs
 		"-b", "/sys/fs/cgroup",
 		"-b", tmpBind + ":/tmp",
 		"-w", workingDir,
+	}
+	for _, bind := range extraBinds {
+		bind = strings.TrimSpace(bind)
+		if bind == "" {
+			continue
+		}
+		args = append(args, "-b", bind)
 	}
 	if identity, ok := resolveProotIdentity(rootfs, userSpec); ok {
 		args = append(args, "-i", identity)
@@ -609,7 +689,7 @@ func isAPIVersion(v string) bool {
 	return true
 }
 
-func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore, allowedPrefixes []string, mirrorRules []imageMirrorRule) {
+func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore, allowedPrefixes []string, mirrorRules []imageMirrorRule, unixSocketPath string) {
 	var req createRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -703,7 +783,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 		}
 	}
 	if isRyukImage(resolvedRef) || isRyukImage(req.Image) {
-		env = mergeEnv(env, []string{"DOCKER_HOST=" + dockerHostForInnerClients(r.Host)})
+		env = mergeEnv(env, []string{"DOCKER_HOST=" + dockerHostForInnerClients(unixSocketPath, r.Host)})
 	}
 	workingDir := req.WorkingDir
 	if workingDir == "" {
@@ -771,7 +851,20 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 	}
 	cmdArgs = resolveCommandInRootfs(c.Rootfs, c.Env, cmdArgs)
 
-	cmd, err := buildContainerCommand(c.Rootfs, containerTmpDir(c), c.WorkingDir, c.User, cmdArgs)
+	socketBinds, err := dockerSocketBindsForContainer(c, unixSocketPathFromContainerEnv(c.Env))
+	if err != nil {
+		if reserved {
+			m.mu.Lock()
+			if m.running > 0 {
+				m.running--
+			}
+			m.mu.Unlock()
+		}
+		writeError(w, http.StatusInternalServerError, "start failed: "+err.Error())
+		return
+	}
+
+	cmd, err := buildContainerCommand(c.Rootfs, containerTmpDir(c), c.WorkingDir, c.User, socketBinds, cmdArgs)
 	if err != nil {
 		if reserved {
 			m.mu.Lock()
@@ -1008,7 +1101,12 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, store *containerSto
 		return
 	}
 	cmdArgs := resolveCommandInRootfs(c.Rootfs, c.Env, inst.Cmd)
-	cmd, err := buildContainerCommand(c.Rootfs, containerTmpDir(c), c.WorkingDir, c.User, cmdArgs)
+	socketBinds, err := dockerSocketBindsForContainer(c, unixSocketPathFromContainerEnv(c.Env))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "exec start failed: "+err.Error())
+		return
+	}
+	cmd, err := buildContainerCommand(c.Rootfs, containerTmpDir(c), c.WorkingDir, c.User, socketBinds, cmdArgs)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "exec start failed: "+err.Error())
 		return
@@ -3046,7 +3144,10 @@ func isOracleImage(image string) bool {
 	return strings.Contains(norm, "oracle")
 }
 
-func dockerHostForInnerClients(requestHost string) string {
+func dockerHostForInnerClients(unixSocketPath, requestHost string) string {
+	if strings.TrimSpace(unixSocketPath) != "" {
+		return "unix:///tmp/sidewhale/docker.sock"
+	}
 	host := strings.TrimSpace(requestHost)
 	if host == "" {
 		return "tcp://127.0.0.1:23750"
@@ -3055,6 +3156,34 @@ func dockerHostForInnerClients(requestHost string) string {
 		return host
 	}
 	return "tcp://" + host
+}
+
+func unixSocketPathFromContainerEnv(env []string) string {
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "DOCKER_HOST=") {
+			continue
+		}
+		val := strings.TrimPrefix(kv, "DOCKER_HOST=")
+		if strings.HasPrefix(val, "unix://") {
+			return strings.TrimPrefix(val, "unix://")
+		}
+	}
+	return ""
+}
+
+func dockerSocketBindsForContainer(c *Container, socketPath string) ([]string, error) {
+	socketPath = strings.TrimSpace(socketPath)
+	if socketPath == "" || c == nil {
+		return nil, nil
+	}
+	binds := []string{socketPath + ":" + socketPath}
+	if socketPath != "/var/run/docker.sock" {
+		binds = append(binds, socketPath+":/var/run/docker.sock")
+	}
+	if socketPath != "/run/docker.sock" {
+		binds = append(binds, socketPath+":/run/docker.sock")
+	}
+	return binds, nil
 }
 
 func listImages(stateDir string) ([]map[string]interface{}, error) {
@@ -3082,9 +3211,14 @@ func listImages(stateDir string) ([]map[string]interface{}, error) {
 				meta.DiskUsage = size
 			}
 		}
+		created := int64(0)
+		if info, statErr := os.Stat(metaPath); statErr == nil {
+			created = info.ModTime().Unix()
+		}
 		out = append(out, map[string]interface{}{
 			"Id":          meta.Digest,
 			"RepoTags":    []string{meta.Reference},
+			"Created":     created,
 			"Size":        meta.ContentSize,
 			"VirtualSize": meta.DiskUsage,
 			"SharedSize":  0,

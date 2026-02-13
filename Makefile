@@ -11,7 +11,7 @@ help:
 	@echo "Targets:"
 	@echo "  build   Build $(BINARY) binary"
 	@echo "  image   Build container image ($(IMAGE_NAME):$(VERSION))"
-	@echo "  image-run   Run image and print DOCKER_HOST env var"
+	@echo "  image-run   Run image in host network mode and print DOCKER_HOST env var"
 	@echo "  clean   Remove build artifacts"
 	@echo "Variables:"
 	@echo "  VERSION    Override version tag (default: git describe or dev)"
@@ -27,7 +27,7 @@ image-run:
 	@echo "Set:"
 	@echo "  export DOCKER_HOST=tcp://127.0.0.1:23750"
 	@echo ""
-	docker run --rm -p 23750:23750 $(IMAGE_NAME):$(VERSION)
+	docker run --rm --network host $(IMAGE_NAME):$(VERSION) --listen :23750 --listen-unix /tmp/sidewhale/docker.sock
 
 clean:
 	rm -f $(BINARY)

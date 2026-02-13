@@ -19,6 +19,7 @@ Current focus:
 ## What Works Right Now
 
 - Basic Testcontainers lifecycle (`create`, `start`, `inspect`, `logs`, `stop`, `delete`)
+- Unix socket listener (default: `<state-dir>/docker.sock`) for in-container Docker clients
 - Image pulling and rootfs extraction
 - Port publishing through TCP proxying
 - In-cluster sidecar run in k3d for PostgreSQL test (`DatabaseTest`) passed
@@ -66,11 +67,14 @@ Not implemented:
 
 ```bash
 docker build -t sidewhale:dev .
-docker run --rm --network host sidewhale:dev --listen :23750
+docker run --rm --network host sidewhale:dev --listen :23750 --listen-unix /tmp/sidewhale/docker.sock
 ```
 
 Then point Testcontainers (or any Docker API client) to:
 
 ```bash
 DOCKER_HOST=tcp://127.0.0.1:23750
+
+# Ryuk/inner clients can use:
+# DOCKER_HOST=unix:///var/run/docker.sock
 ```

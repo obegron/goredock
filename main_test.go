@@ -7,8 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 	"testing"
+	"time"
 )
 
 func TestRewriteVersionedPath(t *testing.T) {
@@ -397,16 +397,18 @@ func TestIsRyukImage(t *testing.T) {
 
 func TestDockerHostForInnerClients(t *testing.T) {
 	tests := []struct {
-		host string
-		want string
+		unixPath string
+		host     string
+		want     string
 	}{
+		{unixPath: "/tmp/sidewhale/docker.sock", host: "127.0.0.1:8080", want: "unix:///tmp/sidewhale/docker.sock"},
 		{host: "127.0.0.1:8080", want: "tcp://127.0.0.1:8080"},
 		{host: "", want: "tcp://127.0.0.1:23750"},
 		{host: "tcp://10.0.0.5:2375", want: "tcp://10.0.0.5:2375"},
 	}
 	for _, tt := range tests {
-		if got := dockerHostForInnerClients(tt.host); got != tt.want {
-			t.Fatalf("dockerHostForInnerClients(%q) = %q, want %q", tt.host, got, tt.want)
+		if got := dockerHostForInnerClients(tt.unixPath, tt.host); got != tt.want {
+			t.Fatalf("dockerHostForInnerClients(%q,%q) = %q, want %q", tt.unixPath, tt.host, got, tt.want)
 		}
 	}
 }
@@ -463,5 +465,51 @@ func TestMapArchiveDestinationPath(t *testing.T) {
 				t.Fatalf("mapArchiveDestinationPath(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveUnixSocketPath(t *testing.T) {
+	stateDir := "/tmp/sw"
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "", want: "/tmp/sw/docker.sock"},
+		{in: "-", want: ""},
+		{in: "off", want: ""},
+		{in: "/run/user/1000/sw.sock", want: "/run/user/1000/sw.sock"},
+	}
+	for _, tt := range tests {
+		if got := resolveUnixSocketPath(tt.in, stateDir); got != tt.want {
+			t.Fatalf("resolveUnixSocketPath(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestDockerSocketBindsForContainer(t *testing.T) {
+	rootfs := t.TempDir()
+	c := &Container{Rootfs: rootfs}
+	binds, err := dockerSocketBindsForContainer(c, "/tmp/sidewhale/docker.sock")
+	if err != nil {
+		t.Fatalf("dockerSocketBindsForContainer error: %v", err)
+	}
+	if len(binds) != 3 {
+		t.Fatalf("bind count = %d, want 3", len(binds))
+	}
+	if binds[0] != "/tmp/sidewhale/docker.sock:/tmp/sidewhale/docker.sock" {
+		t.Fatalf("unexpected bind[0]: %q", binds[0])
+	}
+	if binds[1] != "/tmp/sidewhale/docker.sock:/var/run/docker.sock" {
+		t.Fatalf("unexpected bind[1]: %q", binds[1])
+	}
+	if binds[2] != "/tmp/sidewhale/docker.sock:/run/docker.sock" {
+		t.Fatalf("unexpected bind[2]: %q", binds[2])
+	}
+}
+
+func TestUnixSocketPathFromContainerEnv(t *testing.T) {
+	env := []string{"A=B", "DOCKER_HOST=unix:///tmp/sidewhale/docker.sock"}
+	if got := unixSocketPathFromContainerEnv(env); got != "/tmp/sidewhale/docker.sock" {
+		t.Fatalf("unixSocketPathFromContainerEnv = %q, want %q", got, "/tmp/sidewhale/docker.sock")
 	}
 }
