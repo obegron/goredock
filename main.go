@@ -2948,7 +2948,8 @@ func firstNonEmpty(values ...string) string {
 func resolveProotIdentity(rootfs, userSpec string) (string, bool) {
 	spec := strings.TrimSpace(userSpec)
 	if spec == "" {
-		return "", false
+		// Docker defaults to root when no image/user override is set.
+		return "0:0", true
 	}
 
 	userPart := spec

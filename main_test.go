@@ -596,6 +596,13 @@ func TestEnsureSyntheticUserIdentityIdempotent(t *testing.T) {
 	}
 }
 
+func TestResolveProotIdentityDefaultsToRoot(t *testing.T) {
+	rootfs := t.TempDir()
+	if got, ok := resolveProotIdentity(rootfs, ""); !ok || got != "0:0" {
+		t.Fatalf("resolveProotIdentity(empty) = (%q,%v), want (%q,%v)", got, ok, "0:0", true)
+	}
+}
+
 func TestIsConfluentKafkaImage(t *testing.T) {
 	tests := []struct {
 		image string
