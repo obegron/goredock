@@ -401,7 +401,7 @@ func TestDockerHostForInnerClients(t *testing.T) {
 		want string
 	}{
 		{host: "127.0.0.1:8080", want: "tcp://127.0.0.1:8080"},
-		{host: "", want: "tcp://127.0.0.1:8080"},
+		{host: "", want: "tcp://127.0.0.1:23750"},
 		{host: "tcp://10.0.0.5:2375", want: "tcp://10.0.0.5:2375"},
 	}
 	for _, tt := range tests {

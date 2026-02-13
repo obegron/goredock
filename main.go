@@ -37,6 +37,7 @@ type Container struct {
 	ID         string    `json:"Id"`
 	Name       string    `json:"Name,omitempty"`
 	Hostname   string    `json:"Hostname,omitempty"`
+	User       string    `json:"User,omitempty"`
 	Image      string    `json:"Image"`
 	Rootfs     string    `json:"Rootfs"`
 	Created    time.Time `json:"Created"`
@@ -77,6 +78,7 @@ type metrics struct {
 type createRequest struct {
 	Image        string              `json:"Image"`
 	Hostname     string              `json:"Hostname"`
+	User         string              `json:"User"`
 	Cmd          []string            `json:"Cmd"`
 	Env          []string            `json:"Env"`
 	Entrypoint   []string            `json:"Entrypoint"`
@@ -122,6 +124,8 @@ type imageMeta struct {
 	WorkingDir   string              `json:"WorkingDir"`
 	User         string              `json:"User,omitempty"`
 	Extractor    string              `json:"Extractor,omitempty"`
+	ContentSize  int64               `json:"ContentSize,omitempty"`
+	DiskUsage    int64               `json:"DiskUsage,omitempty"`
 }
 
 type runtimeLimits struct {
@@ -158,12 +162,12 @@ const extractorVersion = "v2"
 
 func main() {
 	var (
-		listenAddr    = flag.String("listen", ":8080", "listen address")
+		listenAddr    = flag.String("listen", ":23750", "listen address")
 		stateDir      = flag.String("state-dir", "/tmp/tcexecutor", "state directory")
 		maxConcurrent = flag.Int("max-concurrent", 4, "max concurrent containers (0 = unlimited)")
 		maxRuntime    = flag.Duration("max-runtime", 30*time.Minute, "max runtime per container (0 = unlimited)")
 		maxLogBytes   = flag.Int64("max-log-bytes", 50*1024*1024, "max log size in bytes (0 = unlimited)")
-		maxMemBytes   = flag.Int64("max-mem-bytes", 512*1024*1024, "soft memory limit in bytes (0 = unlimited)")
+		maxMemBytes   = flag.Int64("max-mem-bytes", 0, "soft memory limit in bytes (0 = unlimited)")
 		allowedImages = flag.String("allowed-images", "", "comma-separated allowed image prefixes")
 		policyFile    = flag.String("image-policy-file", "", "YAML file with allowed image prefixes")
 		imageMirrors  = flag.String("image-mirrors", "", "comma-separated image rewrite rules from=to")
@@ -351,6 +355,12 @@ func main() {
 				return
 			}
 			handleLogs(w, r, store, id)
+		case "stats":
+			if r.Method != http.MethodGet {
+				writeError(w, http.StatusNotFound, "not found")
+				return
+			}
+			handleStats(w, r, store, id)
 		case "archive":
 			switch r.Method {
 			case http.MethodGet:
@@ -476,7 +486,7 @@ func requireUnprivilegedRuntime(euid int) error {
 	return nil
 }
 
-func buildContainerCommand(rootfs, workingDir string, cmdArgs []string) (*exec.Cmd, error) {
+func buildContainerCommand(rootfs, tmpBind, workingDir, userSpec string, cmdArgs []string) (*exec.Cmd, error) {
 	if len(cmdArgs) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
@@ -487,15 +497,22 @@ func buildContainerCommand(rootfs, workingDir string, cmdArgs []string) (*exec.C
 	if workingDir == "" {
 		workingDir = "/"
 	}
+	if strings.TrimSpace(tmpBind) == "" {
+		tmpBind = "/tmp"
+	}
 	// -r: explicit guest rootfs (avoiding -R auto-binds)
-	// -b /proc, /dev, /tmp: explicit essential binds
+	// -b /proc, /dev, /tmp, /sys/fs/cgroup: explicit essential binds
 	// -w: set working directory
 	args := []string{
 		"-r", rootfs,
 		"-b", "/proc",
 		"-b", "/dev",
-		"-b", "/tmp",
+		"-b", "/sys/fs/cgroup",
+		"-b", tmpBind + ":/tmp",
 		"-w", workingDir,
+	}
+	if identity, ok := resolveProotIdentity(rootfs, userSpec); ok {
+		args = append(args, "-i", identity)
 	}
 	// Wrap with /usr/bin/env to ensure the guest environment is used for resolution
 	// if /usr/bin/env exists in the guest, otherwise use the command directly.
@@ -642,6 +659,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 		return
 	}
 	logPath := filepath.Join(store.stateDir, "containers", id, "container.log")
+	tmpPath := filepath.Join(store.stateDir, "containers", id, "tmp")
+	if err := os.MkdirAll(tmpPath, 0o777); err != nil {
+		writeError(w, http.StatusInternalServerError, "tmp allocation failed")
+		return
+	}
 
 	entrypoint := req.Entrypoint
 	cmd := req.Cmd
@@ -660,9 +682,24 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 	if !envHasKey(env, "HOSTNAME") && hostname != "" {
 		env = append(env, "HOSTNAME="+hostname)
 	}
+	if isOracleImage(resolvedRef) || isOracleImage(req.Image) {
+		if !envHasKey(env, "ORACLE_HOSTNAME") {
+			env = append(env, "ORACLE_HOSTNAME="+hostname)
+		}
+	}
 	if isRabbitMQImage(resolvedRef) || isRabbitMQImage(req.Image) {
 		if !envHasKey(env, "RABBITMQ_NODENAME") {
 			env = append(env, "RABBITMQ_NODENAME=rabbit@"+hostname)
+		}
+		if !envHasKey(env, "ERL_EPMD_PORT") {
+			if epmdPort, epmdErr := allocatePort(); epmdErr == nil {
+				env = append(env, "ERL_EPMD_PORT="+strconv.Itoa(epmdPort))
+			}
+		}
+		if !envHasKey(env, "RABBITMQ_DIST_PORT") {
+			if distPort, distErr := allocatePort(); distErr == nil {
+				env = append(env, "RABBITMQ_DIST_PORT="+strconv.Itoa(distPort))
+			}
 		}
 	}
 	if isRyukImage(resolvedRef) || isRyukImage(req.Image) {
@@ -687,6 +724,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 		ID:         id,
 		Name:       name,
 		Hostname:   hostname,
+		User:       firstNonEmpty(strings.TrimSpace(req.User), strings.TrimSpace(meta.User)),
 		Image:      req.Image,
 		Rootfs:     rootfs,
 		Created:    time.Now().UTC(),
@@ -733,7 +771,7 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 	}
 	cmdArgs = resolveCommandInRootfs(c.Rootfs, c.Env, cmdArgs)
 
-	cmd, err := buildContainerCommand(c.Rootfs, c.WorkingDir, cmdArgs)
+	cmd, err := buildContainerCommand(c.Rootfs, containerTmpDir(c), c.WorkingDir, c.User, cmdArgs)
 	if err != nil {
 		if reserved {
 			m.mu.Lock()
@@ -919,6 +957,7 @@ func handleJSON(w http.ResponseWriter, r *http.Request, store *containerStore, i
 			"Env":      c.Env,
 			"Cmd":      c.Cmd,
 			"Hostname": c.Hostname,
+			"User":     c.User,
 		},
 		"NetworkSettings": map[string]interface{}{
 			"Ports": toDockerPorts(c.Ports),
@@ -969,7 +1008,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, store *containerSto
 		return
 	}
 	cmdArgs := resolveCommandInRootfs(c.Rootfs, c.Env, inst.Cmd)
-	cmd, err := buildContainerCommand(c.Rootfs, c.WorkingDir, cmdArgs)
+	cmd, err := buildContainerCommand(c.Rootfs, containerTmpDir(c), c.WorkingDir, c.User, cmdArgs)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "exec start failed: "+err.Error())
 		return
@@ -1105,6 +1144,72 @@ func handleLogs(w http.ResponseWriter, r *http.Request, store *containerStore, i
 	}
 }
 
+func handleStats(w http.ResponseWriter, r *http.Request, store *containerStore, id string) {
+	c, ok := store.get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "container not found")
+		return
+	}
+
+	now := time.Now().UTC()
+	memUsage, _ := readRSS(c.Pid)
+	if !c.Running {
+		memUsage = 0
+	}
+	memLimit := readMemTotal()
+	if memLimit == 0 {
+		memLimit = 1
+	}
+	payload := map[string]interface{}{
+		"read":      now.Format(time.RFC3339Nano),
+		"preread":   now.Format(time.RFC3339Nano),
+		"id":        c.ID,
+		"name":      containerDisplayName(c),
+		"num_procs": 1,
+		"pids_stats": map[string]interface{}{
+			"current": 1,
+		},
+		"cpu_stats": map[string]interface{}{
+			"cpu_usage": map[string]interface{}{
+				"total_usage":         0,
+				"percpu_usage":        []int64{},
+				"usage_in_kernelmode": 0,
+				"usage_in_usermode":   0,
+			},
+			"system_cpu_usage": 0,
+			"online_cpus":      runtime.NumCPU(),
+		},
+		"precpu_stats": map[string]interface{}{
+			"cpu_usage": map[string]interface{}{
+				"total_usage":  0,
+				"percpu_usage": []int64{},
+			},
+			"system_cpu_usage": 0,
+			"online_cpus":      runtime.NumCPU(),
+		},
+		"memory_stats": map[string]interface{}{
+			"usage": memUsage,
+			"limit": memLimit,
+			"stats": map[string]interface{}{},
+		},
+		"networks": map[string]interface{}{},
+		"blkio_stats": map[string]interface{}{
+			"io_service_bytes_recursive": []interface{}{},
+			"io_serviced_recursive":      []interface{}{},
+		},
+	}
+
+	stream := parseDockerBool(r.URL.Query().Get("stream"), true)
+	if !stream {
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
 func handleWait(w http.ResponseWriter, r *http.Request, store *containerStore, id string) {
 	condition := strings.TrimSpace(r.URL.Query().Get("condition"))
 	if condition == "" {
@@ -1154,7 +1259,7 @@ func handleArchiveGet(w http.ResponseWriter, r *http.Request, store *containerSt
 		return
 	}
 	queryPath := strings.TrimSpace(r.URL.Query().Get("path"))
-	targetPath, err := resolvePathInRootfs(c.Rootfs, queryPath)
+	targetPath, err := resolvePathInContainerFS(c, queryPath)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid archive path")
 		return
@@ -1216,7 +1321,7 @@ func handleArchivePut(w http.ResponseWriter, r *http.Request, store *containerSt
 		return
 	}
 	queryPath := strings.TrimSpace(r.URL.Query().Get("path"))
-	targetPath, err := resolvePathInRootfs(c.Rootfs, queryPath)
+	targetPath, err := resolvePathInContainerFS(c, queryPath)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid archive path")
 		return
@@ -1228,24 +1333,37 @@ func handleArchivePut(w http.ResponseWriter, r *http.Request, store *containerSt
 	w.WriteHeader(http.StatusOK)
 }
 
-func resolvePathInRootfs(rootfs string, requested string) (string, error) {
+func resolvePathInContainerFS(c *Container, requested string) (string, error) {
 	req := strings.TrimSpace(requested)
 	if req == "" {
 		return "", fmt.Errorf("path is required")
 	}
 	clean := path.Clean("/" + req)
-	rel := strings.TrimPrefix(clean, "/")
-	if rel == "." || rel == "" {
-		rel = ""
+
+	// Runtime binds a dedicated host path over /tmp, so archive operations must
+	// target that bind-backed path to match what the process sees at execution.
+	if clean == "/tmp" || strings.HasPrefix(clean, "/tmp/") {
+		relTmp := strings.TrimPrefix(clean, "/tmp")
+		relTmp = strings.TrimPrefix(relTmp, "/")
+		return resolvePathUnder(containerTmpDir(c), relTmp)
 	}
-	full := filepath.Join(rootfs, filepath.FromSlash(rel))
-	rootClean := filepath.Clean(rootfs)
-	relCheck, err := filepath.Rel(rootClean, full)
+
+	relRoot := strings.TrimPrefix(clean, "/")
+	if relRoot == "." || relRoot == "" {
+		relRoot = ""
+	}
+	return resolvePathUnder(c.Rootfs, relRoot)
+}
+
+func resolvePathUnder(base string, rel string) (string, error) {
+	full := filepath.Join(base, filepath.FromSlash(rel))
+	baseClean := filepath.Clean(base)
+	relCheck, err := filepath.Rel(baseClean, full)
 	if err != nil {
 		return "", err
 	}
 	if relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path escapes rootfs")
+		return "", fmt.Errorf("path escapes base")
 	}
 	return full, nil
 }
@@ -1626,6 +1744,13 @@ func containerDisplayName(c *Container) string {
 		name = c.ID
 	}
 	return "/" + name
+}
+
+func containerTmpDir(c *Container) string {
+	if c == nil {
+		return "/tmp"
+	}
+	return filepath.Join(filepath.Dir(c.Rootfs), "tmp")
 }
 
 func (s *containerStore) nameInUse(raw string) bool {
@@ -2304,15 +2429,73 @@ func proxyConn(src net.Conn, containerPort int) {
 	defer src.Close()
 	dst, err := dialContainerPort(containerPort)
 	if err != nil {
+		fmt.Printf("tcexecutor: proxy dial failed containerPort=%d err=%v\n", containerPort, err)
 		return
 	}
 	defer dst.Close()
+	done := make(chan struct{})
+	var c2sBytes int64
+	var c2sSample string
+	var c2sErr error
 	go func() {
-		_, _ = io.Copy(dst, src)
-		_ = dst.(*net.TCPConn).CloseWrite()
+		c2sBytes, c2sSample, c2sErr = proxyCopy(dst, src)
+		if c2sErr != nil {
+			fmt.Printf("tcexecutor: proxy c->s copy error containerPort=%d bytes=%d err=%v\n", containerPort, c2sBytes, c2sErr)
+		}
+		_ = closeWrite(dst)
+		close(done)
 	}()
-	_, _ = io.Copy(src, dst)
-	_ = src.(*net.TCPConn).CloseWrite()
+	s2cBytes, s2cSample, s2cErr := proxyCopy(src, dst)
+	if s2cErr != nil {
+		fmt.Printf("tcexecutor: proxy s->c copy error containerPort=%d bytes=%d err=%v\n", containerPort, s2cBytes, s2cErr)
+	}
+	_ = closeWrite(src)
+	<-done
+	if c2sErr != nil || s2cErr != nil {
+		fmt.Printf("tcexecutor: proxy closed containerPort=%d c2s=%d s2c=%d c2sErr=%v s2cErr=%v c2sSample=%s s2cSample=%s\n", containerPort, c2sBytes, s2cBytes, c2sErr, s2cErr, c2sSample, s2cSample)
+	}
+}
+
+// proxyCopy intentionally avoids io.Copy to prevent splice/zero-copy quirks in long-lived protocol streams.
+func proxyCopy(dst net.Conn, src net.Conn) (int64, string, error) {
+	buf := make([]byte, 32*1024)
+	var written int64
+	sample := make([]byte, 0, 64)
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			if len(sample) < cap(sample) {
+				take := nr
+				remaining := cap(sample) - len(sample)
+				if take > remaining {
+					take = remaining
+				}
+				sample = append(sample, buf[:take]...)
+			}
+			nw, ew := dst.Write(buf[:nr])
+			written += int64(nw)
+			if ew != nil {
+				return written, hex.EncodeToString(sample), ew
+			}
+			if nw != nr {
+				return written, hex.EncodeToString(sample), io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if errors.Is(er, io.EOF) {
+				return written, hex.EncodeToString(sample), nil
+			}
+			return written, hex.EncodeToString(sample), er
+		}
+	}
+}
+
+func closeWrite(conn net.Conn) error {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return nil
+	}
+	return tcp.CloseWrite()
 }
 
 func dialContainerPort(containerPort int) (net.Conn, error) {
@@ -2339,10 +2522,14 @@ func monitorContainer(id string, pid int, logPath string, store *containerStore,
 	if pid <= 0 {
 		return
 	}
-	if limits.maxRuntime <= 0 && limits.maxLogBytes <= 0 && limits.maxMemBytes <= 0 {
+	c, ok := store.get(id)
+	checkOracleFatal := ok && isOracleImage(c.Image)
+	if limits.maxRuntime <= 0 && limits.maxLogBytes <= 0 && limits.maxMemBytes <= 0 && !checkOracleFatal {
 		return
 	}
 	deadline := time.Now().Add(limits.maxRuntime)
+	var scannedOffset int64
+	var scannedCarry string
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -2350,12 +2537,14 @@ func monitorContainer(id string, pid int, logPath string, store *containerStore,
 			return
 		}
 		if limits.maxRuntime > 0 && time.Now().After(deadline) {
+			fmt.Printf("tcexecutor: monitor killed container id=%s pid=%d reason=max_runtime limit=%s\n", id, pid, limits.maxRuntime)
 			_ = killProcessGroup(pid, syscall.SIGKILL)
 			store.markStopped(id)
 			return
 		}
 		if limits.maxLogBytes > 0 {
 			if info, err := os.Stat(logPath); err == nil && info.Size() > limits.maxLogBytes {
+				fmt.Printf("tcexecutor: monitor killed container id=%s pid=%d reason=max_log_bytes size=%d limit=%d\n", id, pid, info.Size(), limits.maxLogBytes)
 				_ = killProcessGroup(pid, syscall.SIGKILL)
 				store.markStopped(id)
 				return
@@ -2363,12 +2552,75 @@ func monitorContainer(id string, pid int, logPath string, store *containerStore,
 		}
 		if limits.maxMemBytes > 0 {
 			if rss, err := readRSS(pid); err == nil && rss > limits.maxMemBytes {
+				fmt.Printf("tcexecutor: monitor killed container id=%s pid=%d reason=max_mem_bytes rss=%d limit=%d\n", id, pid, rss, limits.maxMemBytes)
+				_ = killProcessGroup(pid, syscall.SIGKILL)
+				store.markStopped(id)
+				return
+			}
+		}
+		if checkOracleFatal {
+			matched, sig, nextOffset, nextCarry := scanFatalLogSignatures(logPath, scannedOffset, scannedCarry, oracleFatalLogSignatures)
+			scannedOffset = nextOffset
+			scannedCarry = nextCarry
+			if matched {
+				fmt.Printf("tcexecutor: monitor killed container id=%s pid=%d reason=fatal_log signature=%q\n", id, pid, sig)
 				_ = killProcessGroup(pid, syscall.SIGKILL)
 				store.markStopped(id)
 				return
 			}
 		}
 	}
+}
+
+var oracleFatalLogSignatures = []string{
+	"ora-27300: os system dependent operation:pr_set_dumpable failed",
+	"ora-27301: os failure message: function not implemented",
+	"ora-27302: failure occurred at: sskgp_mod_fd",
+	"sp2-0157: unable to connect to oracle",
+}
+
+func scanFatalLogSignatures(logPath string, offset int64, carry string, signatures []string) (bool, string, int64, string) {
+	info, err := os.Stat(logPath)
+	if err != nil {
+		return false, "", offset, carry
+	}
+	if info.Size() < offset {
+		offset = 0
+		carry = ""
+	}
+	if info.Size() == offset {
+		return false, "", offset, carry
+	}
+
+	f, err := os.Open(logPath)
+	if err != nil {
+		return false, "", offset, carry
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return false, "", offset, carry
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return false, "", offset, carry
+	}
+	offset += int64(len(data))
+
+	text := strings.ToLower(carry + string(data))
+	for _, sig := range signatures {
+		if strings.Contains(text, sig) {
+			return true, sig, offset, carry
+		}
+	}
+
+	const maxCarry = 4096
+	if len(text) > maxCarry {
+		carry = text[len(text)-maxCarry:]
+	} else {
+		carry = text
+	}
+	return false, "", offset, carry
 }
 
 func terminateProcessTree(pid int, grace time.Duration) {
@@ -2485,6 +2737,158 @@ func deduplicateEnv(env []string) []string {
 	return out
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func resolveProotIdentity(rootfs, userSpec string) (string, bool) {
+	spec := strings.TrimSpace(userSpec)
+	if spec == "" {
+		return "", false
+	}
+
+	userPart := spec
+	groupPart := ""
+	if i := strings.Index(spec, ":"); i >= 0 {
+		userPart = spec[:i]
+		groupPart = spec[i+1:]
+	}
+
+	uid, defaultGID, ok := resolveUserToken(rootfs, userPart)
+	if !ok {
+		return "", false
+	}
+	gid := defaultGID
+	if strings.TrimSpace(groupPart) != "" {
+		groupID, gok := resolveGroupToken(rootfs, groupPart)
+		if !gok {
+			return "", false
+		}
+		gid = groupID
+	}
+	if gid == "" {
+		gid = uid
+	}
+	return uid + ":" + gid, true
+}
+
+func resolveUserToken(rootfs, token string) (uid, gid string, ok bool) {
+	t := strings.TrimSpace(token)
+	if t == "" {
+		return "", "", false
+	}
+	if isDigits(t) {
+		if gid, found := lookupGIDForUID(rootfs, t); found {
+			return t, gid, true
+		}
+		return t, t, true
+	}
+	return lookupUserByName(rootfs, t)
+}
+
+func resolveGroupToken(rootfs, token string) (string, bool) {
+	t := strings.TrimSpace(token)
+	if t == "" {
+		return "", false
+	}
+	if isDigits(t) {
+		return t, true
+	}
+	return lookupGroupByName(rootfs, t)
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func lookupUserByName(rootfs, name string) (uid, gid string, ok bool) {
+	data, err := os.ReadFile(filepath.Join(rootfs, "etc", "passwd"))
+	if err != nil {
+		return "", "", false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 4 {
+			continue
+		}
+		if fields[0] != name {
+			continue
+		}
+		if !isDigits(fields[2]) || !isDigits(fields[3]) {
+			return "", "", false
+		}
+		return fields[2], fields[3], true
+	}
+	return "", "", false
+}
+
+func lookupGIDForUID(rootfs, uid string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(rootfs, "etc", "passwd"))
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 4 {
+			continue
+		}
+		if fields[2] != uid {
+			continue
+		}
+		if !isDigits(fields[3]) {
+			return "", false
+		}
+		return fields[3], true
+	}
+	return "", false
+}
+
+func lookupGroupByName(rootfs, name string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(rootfs, "etc", "group"))
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 3 {
+			continue
+		}
+		if fields[0] != name {
+			continue
+		}
+		if !isDigits(fields[2]) {
+			return "", false
+		}
+		return fields[2], true
+	}
+	return "", false
+}
+
 func defaultContainerHostname(id string) string {
 	if len(id) >= 12 {
 		return id[:12]
@@ -2578,10 +2982,16 @@ func isRabbitMQImage(image string) bool {
 	return strings.Contains(norm, "rabbitmq")
 }
 
+func isOracleImage(image string) bool {
+	norm := strings.ToLower(strings.TrimSpace(image))
+	norm = strings.TrimPrefix(norm, "docker.io/")
+	return strings.Contains(norm, "oracle")
+}
+
 func dockerHostForInnerClients(requestHost string) string {
 	host := strings.TrimSpace(requestHost)
 	if host == "" {
-		return "tcp://127.0.0.1:8080"
+		return "tcp://127.0.0.1:23750"
 	}
 	if strings.Contains(host, "://") {
 		return host
@@ -2609,9 +3019,17 @@ func listImages(stateDir string) ([]map[string]interface{}, error) {
 		if err := json.Unmarshal(data, &meta); err != nil {
 			continue
 		}
+		if meta.DiskUsage == 0 {
+			if size, sizeErr := dirSize(filepath.Join(imageRoot, entry.Name(), "rootfs")); sizeErr == nil {
+				meta.DiskUsage = size
+			}
+		}
 		out = append(out, map[string]interface{}{
-			"Id":       meta.Digest,
-			"RepoTags": []string{meta.Reference},
+			"Id":          meta.Digest,
+			"RepoTags":    []string{meta.Reference},
+			"Size":        meta.ContentSize,
+			"VirtualSize": meta.DiskUsage,
+			"SharedSize":  0,
 		})
 	}
 	return out, nil
@@ -2656,6 +3074,14 @@ func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (
 			_ = json.Unmarshal(data, &meta)
 		}
 		if meta.Extractor == extractorVersion {
+			if meta.DiskUsage == 0 {
+				if usage, usageErr := dirSize(rootfsDir); usageErr == nil {
+					meta.DiskUsage = usage
+					if data, marshalErr := json.MarshalIndent(meta, "", "  "); marshalErr == nil {
+						_ = os.WriteFile(metaPath, data, 0o644)
+					}
+				}
+			}
 			return rootfsDir, meta, nil
 		}
 		_ = os.RemoveAll(rootfsDir)
@@ -2675,8 +3101,12 @@ func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (
 	if err != nil {
 		return "", imageMeta{}, fmt.Errorf("layer list failed: %w", err)
 	}
+	var contentSize int64
 	dirModes := map[string]dirAttributes{}
 	for _, layer := range layers {
+		if size, sizeErr := layer.Size(); sizeErr == nil && size > 0 {
+			contentSize += size
+		}
 		if err := extractLayer(tmpRootfs, layer, dirModes); err != nil {
 			_ = os.RemoveAll(tmpRootfs)
 			return "", imageMeta{}, err
@@ -2690,11 +3120,14 @@ func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (
 		_ = os.RemoveAll(tmpRootfs)
 		return "", imageMeta{}, fmt.Errorf("rootfs finalize failed: %w", err)
 	}
+	diskUsage, _ := dirSize(rootfsDir)
 
 	meta := imageMeta{
-		Reference: ref,
-		Digest:    digest.String(),
-		Extractor: extractorVersion,
+		Reference:   ref,
+		Digest:      digest.String(),
+		Extractor:   extractorVersion,
+		ContentSize: contentSize,
+		DiskUsage:   diskUsage,
 	}
 	if cfg, err := image.ConfigFile(); err == nil && cfg != nil {
 		meta.Entrypoint = cfg.Config.Entrypoint
@@ -2714,6 +3147,25 @@ func ensureImage(ctx context.Context, ref string, stateDir string, m *metrics) (
 		m.mu.Unlock()
 	}
 	return rootfsDir, meta, nil
+}
+
+func dirSize(root string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		return nil
+	})
+	return total, err
 }
 
 type dirAttributes struct {
