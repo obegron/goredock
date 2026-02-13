@@ -266,9 +266,13 @@ func main() {
 		if ref == "" {
 			ref = r.URL.Query().Get("image")
 		}
+		tag := strings.TrimSpace(r.URL.Query().Get("tag"))
 		if ref == "" {
 			writeError(w, http.StatusBadRequest, "missing fromImage")
 			return
+		}
+		if tag != "" && !strings.Contains(ref, "@") && !imageRefHasTag(ref) {
+			ref = ref + ":" + tag
 		}
 		resolvedRef := rewriteImageReference(ref, mirrorRules)
 		if !isImageAllowed(resolvedRef, allowedPrefixes) {
@@ -2111,6 +2115,16 @@ func orderedImageCandidates(ref string, includeContext bool) []string {
 
 func normalizeImageToken(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
+}
+
+func imageRefHasTag(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return false
+	}
+	slash := strings.LastIndex(ref, "/")
+	colon := strings.LastIndex(ref, ":")
+	return colon > slash
 }
 
 func dockerHubAliases(s string) []string {
