@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -21,9 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -31,129 +28,6 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
-
-type Container struct {
-	ID         string    `json:"Id"`
-	Name       string    `json:"Name,omitempty"`
-	Hostname   string    `json:"Hostname,omitempty"`
-	User       string    `json:"User,omitempty"`
-	Image      string    `json:"Image"`
-	Rootfs     string    `json:"Rootfs"`
-	Created    time.Time `json:"Created"`
-	Running    bool      `json:"Running"`
-	Ports      map[int]int
-	Env        []string `json:"Env"`
-	LogPath    string   `json:"LogPath"`
-	Pid        int      `json:"Pid"`
-	Cmd        []string `json:"Cmd"`
-	WorkingDir string   `json:"WorkingDir"`
-}
-
-type containerStore struct {
-	mu         sync.Mutex
-	containers map[string]*Container
-	execs      map[string]*ExecInstance
-	stateDir   string
-	proxies    map[string][]*portProxy
-}
-
-type ExecInstance struct {
-	ID          string
-	ContainerID string
-	Cmd         []string
-	Running     bool
-	ExitCode    int
-	Output      []byte
-}
-
-type metrics struct {
-	mu             sync.Mutex
-	running        int
-	startFailures  int
-	pullDurationMs int64
-	execDurationMs int64
-}
-
-type createRequest struct {
-	Image        string              `json:"Image"`
-	Hostname     string              `json:"Hostname"`
-	User         string              `json:"User"`
-	Cmd          []string            `json:"Cmd"`
-	Env          []string            `json:"Env"`
-	Entrypoint   []string            `json:"Entrypoint"`
-	WorkingDir   string              `json:"WorkingDir"`
-	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
-	HostConfig   hostConfig          `json:"HostConfig"`
-}
-
-type execCreateRequest struct {
-	Cmd          []string `json:"Cmd"`
-	AttachStdout bool     `json:"AttachStdout"`
-	AttachStderr bool     `json:"AttachStderr"`
-}
-
-type execCreateResponse struct {
-	ID string `json:"Id"`
-}
-
-type hostConfig struct {
-	PortBindings map[string][]portBinding `json:"PortBindings"`
-}
-
-type portBinding struct {
-	HostPort string `json:"HostPort"`
-}
-
-type createResponse struct {
-	ID       string        `json:"Id"`
-	Warnings []interface{} `json:"Warnings"`
-}
-
-type errorResponse struct {
-	Message string `json:"message"`
-}
-
-type imageMeta struct {
-	Reference    string              `json:"Reference"`
-	Digest       string              `json:"Digest"`
-	Entrypoint   []string            `json:"Entrypoint"`
-	Cmd          []string            `json:"Cmd"`
-	Env          []string            `json:"Env"`
-	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
-	WorkingDir   string              `json:"WorkingDir"`
-	User         string              `json:"User,omitempty"`
-	Extractor    string              `json:"Extractor,omitempty"`
-	ContentSize  int64               `json:"ContentSize,omitempty"`
-	DiskUsage    int64               `json:"DiskUsage,omitempty"`
-}
-
-type runtimeLimits struct {
-	maxConcurrent int
-	maxRuntime    time.Duration
-	maxLogBytes   int64
-	maxMemBytes   int64
-}
-
-type imagePolicyFile struct {
-	AllowedImages        []string `yaml:"allowed_images"`
-	AllowedImagePrefixes []string `yaml:"allowed_image_prefixes"`
-	Images               []string `yaml:"images"`
-}
-
-type imageMirrorRule struct {
-	FromPrefix string `yaml:"from"`
-	ToPrefix   string `yaml:"to"`
-}
-
-type imageMirrorFile struct {
-	ImageMirrors []imageMirrorRule `yaml:"image_mirrors"`
-	Mirrors      []imageMirrorRule `yaml:"mirrors"`
-}
-
-type portProxy struct {
-	ln   net.Listener
-	stop chan struct{}
-}
 
 var version = "dev"
 
@@ -594,41 +468,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 	}
 
 	env := mergeEnv(meta.Env, req.Env)
-	if !envHasKey(env, "HOSTNAME") && hostname != "" {
-		env = append(env, "HOSTNAME="+hostname)
-	}
-	if isOracleImage(resolvedRef) || isOracleImage(req.Image) {
-		if !envHasKey(env, "ORACLE_HOSTNAME") {
-			env = append(env, "ORACLE_HOSTNAME="+hostname)
-		}
-	}
-	if isRabbitMQImage(resolvedRef) || isRabbitMQImage(req.Image) {
-		if !envHasKey(env, "RABBITMQ_NODENAME") {
-			env = append(env, "RABBITMQ_NODENAME=rabbit@"+hostname)
-		}
-		// Avoid overriding Rabbit defaults unless the default distribution ports are already occupied.
-		if !envHasKey(env, "ERL_EPMD_PORT") && isTCPPortInUse(4369) {
-			if epmdPort, epmdErr := allocatePort(); epmdErr == nil {
-				env = append(env, "ERL_EPMD_PORT="+strconv.Itoa(epmdPort))
-			}
-		}
-		if !envHasKey(env, "RABBITMQ_DIST_PORT") && isTCPPortInUse(25672) {
-			if distPort, distErr := allocatePort(); distErr == nil {
-				env = append(env, "RABBITMQ_DIST_PORT="+strconv.Itoa(distPort))
-			}
-		}
-	}
-	if isConfluentKafkaImage(resolvedRef) || isConfluentKafkaImage(req.Image) {
-		// In sidewhale host-network model, ZooKeeper AdminServer default :8080 can clash with host services.
-		if !envHasKey(env, "ZOOKEEPER_ADMIN_ENABLE_SERVER") {
-			env = append(env, "ZOOKEEPER_ADMIN_ENABLE_SERVER=false")
-		}
-		// cp-kafka startup scripts may ignore ZOOKEEPER_ADMIN_ENABLE_SERVER, but this JVM flag is honored by ZooKeeper.
-		env = ensureEnvContainsToken(env, "KAFKA_OPTS", "-Dzookeeper.admin.enableServer=false")
-	}
-	if isRyukImage(resolvedRef) || isRyukImage(req.Image) {
-		env = mergeEnv(env, []string{"DOCKER_HOST=" + dockerHostForInnerClients(unixSocketPath, r.Host)})
-	}
+	env = applyImageCompat(env, hostname, resolvedRef, req.Image, unixSocketPath, r.Host)
 	workingDir := req.WorkingDir
 	if workingDir == "" {
 		workingDir = meta.WorkingDir
