@@ -729,6 +729,14 @@ func handleJSON(w http.ResponseWriter, r *http.Request, store *containerStore, i
 	if networkMode == "" {
 		networkMode = "bridge"
 	}
+	if strings.TrimSpace(c.K8sPodName) != "" && strings.TrimSpace(c.K8sPodIP) != "" {
+		if bridgeRaw, ok := networks["bridge"]; ok {
+			if bridge, ok := bridgeRaw.(map[string]interface{}); ok {
+				bridge["IPAddress"] = c.K8sPodIP
+				bridge["IPPrefixLen"] = 24
+			}
+		}
+	}
 	switch strings.ToLower(networkMode) {
 	case "none", "host":
 		networks = map[string]interface{}{
