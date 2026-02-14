@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -133,6 +134,10 @@ func normalizeContainerHostname(hostname string) string {
 }
 
 func writeContainerIdentityFiles(rootfs, hostname string) error {
+	return writeContainerIdentityFilesWithAliases(rootfs, hostname, nil)
+}
+
+func writeContainerIdentityFilesWithAliases(rootfs, hostname string, aliases []string) error {
 	hostname = normalizeContainerHostname(hostname)
 	if hostname == "" {
 		return nil
@@ -145,28 +150,41 @@ func writeContainerIdentityFiles(rootfs, hostname string) error {
 		return err
 	}
 
-	hostsPath := filepath.Join(etcDir, "hosts")
-	existing, _ := os.ReadFile(hostsPath)
 	var content strings.Builder
-	if len(existing) > 0 {
-		content.Write(existing)
-		if !strings.HasSuffix(string(existing), "\n") {
-			content.WriteByte('\n')
-		}
-	} else {
-		content.WriteString("127.0.0.1\tlocalhost\n")
-		content.WriteString("::1\tlocalhost ip6-localhost ip6-loopback\n")
-	}
-	if !hostsFileHasHostname(existing, hostname) {
-		content.WriteString("127.0.1.1\t" + hostname + "\n")
-	}
+	content.WriteString("127.0.0.1\tlocalhost\n")
+	content.WriteString("::1\tlocalhost ip6-localhost ip6-loopback\n")
+	content.WriteString("127.0.1.1\t" + hostname + "\n")
 	// In proot we share host UTS hostname; add it so JVM services can resolve local host.
 	if hostName, err := os.Hostname(); err == nil {
 		hostName = normalizeContainerHostname(hostName)
-		if hostName != "" && hostName != hostname && !hostsFileHasHostname(existing, hostName) {
+		if hostName != "" && hostName != hostname {
 			content.WriteString("127.0.1.1\t" + hostName + "\n")
 		}
 	}
+
+	uniq := map[string]struct{}{}
+	for _, alias := range aliases {
+		alias = normalizeContainerHostname(alias)
+		if alias == "" || alias == hostname {
+			continue
+		}
+		if _, ok := uniq[alias]; ok {
+			continue
+		}
+		uniq[alias] = struct{}{}
+	}
+	if len(uniq) > 0 {
+		names := make([]string, 0, len(uniq))
+		for alias := range uniq {
+			names = append(names, alias)
+		}
+		sort.Strings(names)
+		for _, alias := range names {
+			// Sidewhale runs in a shared host network namespace, so aliases route via loopback.
+			content.WriteString("127.0.0.1\t" + alias + "\n")
+		}
+	}
+	hostsPath := filepath.Join(etcDir, "hosts")
 	return os.WriteFile(hostsPath, []byte(content.String()), 0o644)
 }
 

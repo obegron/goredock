@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
-	"strings"
 	"syscall"
 )
 
@@ -66,9 +66,10 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, store *containerSto
 	cmd.Env = deduplicateEnv(append(os.Environ(), c.Env...))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	var buf strings.Builder
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
 	inst.Running = true
 	store.saveExec(inst)
 	runErr := cmd.Run()
@@ -82,13 +83,18 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, store *containerSto
 	} else {
 		inst.ExitCode = 0
 	}
-	inst.Output = []byte(buf.String())
+	inst.Stdout = append([]byte(nil), stdoutBuf.Bytes()...)
+	inst.Stderr = append([]byte(nil), stderrBuf.Bytes()...)
+	inst.Output = append(append([]byte(nil), inst.Stdout...), inst.Stderr...)
 	store.saveExec(inst)
 
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.WriteHeader(http.StatusOK)
-	if len(inst.Output) > 0 {
-		_, _ = w.Write(frameDockerRawStream(1, inst.Output))
+	if len(inst.Stdout) > 0 {
+		_, _ = w.Write(frameDockerRawStream(1, inst.Stdout))
+	}
+	if len(inst.Stderr) > 0 {
+		_, _ = w.Write(frameDockerRawStream(2, inst.Stderr))
 	}
 }
 

@@ -29,6 +29,7 @@ type Container struct {
 	Cmd          []string            `json:"Cmd"`
 	WorkingDir   string              `json:"WorkingDir"`
 	LoopbackIP   string              `json:"LoopbackIP,omitempty"`
+	NetworkMode  string              `json:"NetworkMode,omitempty"`
 }
 
 type containerStore struct {
@@ -47,6 +48,8 @@ type ExecInstance struct {
 	Running     bool
 	ExitCode    int
 	Output      []byte
+	Stdout      []byte
+	Stderr      []byte
 }
 
 type metrics struct {
@@ -58,15 +61,24 @@ type metrics struct {
 }
 
 type createRequest struct {
-	Image        string              `json:"Image"`
-	Hostname     string              `json:"Hostname"`
-	User         string              `json:"User"`
-	Cmd          []string            `json:"Cmd"`
-	Env          []string            `json:"Env"`
-	Entrypoint   []string            `json:"Entrypoint"`
-	WorkingDir   string              `json:"WorkingDir"`
-	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
-	HostConfig   hostConfig          `json:"HostConfig"`
+	Image            string              `json:"Image"`
+	Hostname         string              `json:"Hostname"`
+	User             string              `json:"User"`
+	Cmd              []string            `json:"Cmd"`
+	Env              []string            `json:"Env"`
+	Entrypoint       []string            `json:"Entrypoint"`
+	WorkingDir       string              `json:"WorkingDir"`
+	ExposedPorts     map[string]struct{} `json:"ExposedPorts"`
+	NetworkingConfig networkingConfig    `json:"NetworkingConfig"`
+	HostConfig       hostConfig          `json:"HostConfig"`
+}
+
+type networkingConfig struct {
+	EndpointsConfig map[string]endpointConfig `json:"EndpointsConfig"`
+}
+
+type endpointConfig struct {
+	Aliases []string `json:"Aliases"`
 }
 
 type execCreateRequest struct {
@@ -80,6 +92,7 @@ type execCreateResponse struct {
 }
 
 type hostConfig struct {
+	NetworkMode  string                   `json:"NetworkMode"`
 	PortBindings map[string][]portBinding `json:"PortBindings"`
 }
 
@@ -140,28 +153,28 @@ type portProxy struct {
 }
 
 type Network struct {
-	ID         string                     `json:"Id"`
-	Name       string                     `json:"Name"`
-	Driver     string                     `json:"Driver"`
-	Scope      string                     `json:"Scope"`
-	Created    string                     `json:"Created"`
-	Internal   bool                       `json:"Internal"`
-	Attachable bool                       `json:"Attachable"`
-	Ingress    bool                       `json:"Ingress"`
-	EnableIPv6 bool                       `json:"EnableIPv6,omitempty"`
-	Labels     map[string]string          `json:"Labels,omitempty"`
-	Options    map[string]string          `json:"Options,omitempty"`
-	IPAM       map[string]interface{}     `json:"IPAM,omitempty"`
+	ID         string                      `json:"Id"`
+	Name       string                      `json:"Name"`
+	Driver     string                      `json:"Driver"`
+	Scope      string                      `json:"Scope"`
+	Created    string                      `json:"Created"`
+	Internal   bool                        `json:"Internal"`
+	Attachable bool                        `json:"Attachable"`
+	Ingress    bool                        `json:"Ingress"`
+	EnableIPv6 bool                        `json:"EnableIPv6,omitempty"`
+	Labels     map[string]string           `json:"Labels,omitempty"`
+	Options    map[string]string           `json:"Options,omitempty"`
+	IPAM       map[string]interface{}      `json:"IPAM,omitempty"`
 	Containers map[string]*NetworkEndpoint `json:"Containers,omitempty"`
 }
 
 type NetworkEndpoint struct {
-	Name      string   `json:"Name"`
-	Endpoint  string   `json:"EndpointID"`
-	Mac       string   `json:"MacAddress"`
-	IPv4      string   `json:"IPv4Address"`
-	IPv6      string   `json:"IPv6Address"`
-	Aliases   []string `json:"Aliases,omitempty"`
+	Name     string   `json:"Name"`
+	Endpoint string   `json:"EndpointID"`
+	Mac      string   `json:"MacAddress"`
+	IPv4     string   `json:"IPv4Address"`
+	IPv6     string   `json:"IPv6Address"`
+	Aliases  []string `json:"Aliases,omitempty"`
 }
 
 type networkCreateRequest struct {

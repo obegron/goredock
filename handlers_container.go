@@ -133,11 +133,58 @@ func handleCreate(w http.ResponseWriter, r *http.Request, store *containerStore,
 		StdoutPath:   stdoutPath,
 		StderrPath:   stderrPath,
 		Cmd:          append(entrypoint, cmd...),
+		NetworkMode:  "bridge",
 	}
 
-	if err := store.connectContainerToNetwork(builtInBridgeNetworkID, c, nil); err != nil {
-		writeError(w, http.StatusInternalServerError, "network attach failed")
-		return
+	requestedMode := strings.TrimSpace(req.HostConfig.NetworkMode)
+	if requestedMode != "" {
+		c.NetworkMode = requestedMode
+	}
+	if strings.EqualFold(c.NetworkMode, "default") {
+		c.NetworkMode = "bridge"
+	}
+
+	attachedToNetwork := false
+	for networkRef, endpoint := range req.NetworkingConfig.EndpointsConfig {
+		networkRef = strings.TrimSpace(networkRef)
+		if networkRef == "" {
+			continue
+		}
+		n, ok := store.getNetwork(networkRef)
+		if !ok {
+			writeError(w, http.StatusNotFound, "network not found")
+			return
+		}
+		if err := store.connectContainerToNetwork(n.ID, c, endpoint.Aliases); err != nil {
+			writeError(w, http.StatusInternalServerError, "network attach failed")
+			return
+		}
+		attachedToNetwork = true
+		if strings.TrimSpace(req.HostConfig.NetworkMode) == "" || strings.EqualFold(c.NetworkMode, "default") {
+			c.NetworkMode = n.Name
+		}
+	}
+
+	if !attachedToNetwork {
+		switch strings.ToLower(strings.TrimSpace(c.NetworkMode)) {
+		case "", "default", "bridge":
+			c.NetworkMode = "bridge"
+			if err := store.connectContainerToNetwork(builtInBridgeNetworkID, c, nil); err != nil {
+				writeError(w, http.StatusInternalServerError, "network attach failed")
+				return
+			}
+		case "host", "none":
+		default:
+			n, ok := store.getNetwork(c.NetworkMode)
+			if !ok {
+				writeError(w, http.StatusNotFound, "network not found")
+				return
+			}
+			if err := store.connectContainerToNetwork(n.ID, c, nil); err != nil {
+				writeError(w, http.StatusInternalServerError, "network attach failed")
+				return
+			}
+		}
 	}
 
 	if err := store.save(c); err != nil {
@@ -237,6 +284,17 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 			m.mu.Unlock()
 		}
 		writeError(w, http.StatusInternalServerError, "start failed: tmp permission fix failed")
+		return
+	}
+	if err := writeContainerIdentityFilesWithAliases(c.Rootfs, c.Hostname, store.peerAliasesForContainer(c.ID)); err != nil {
+		if reserved {
+			m.mu.Lock()
+			if m.running > 0 {
+				m.running--
+			}
+			m.mu.Unlock()
+		}
+		writeError(w, http.StatusInternalServerError, "start failed: hosts update failed")
 		return
 	}
 
@@ -472,9 +530,26 @@ func handleJSON(w http.ResponseWriter, r *http.Request, store *containerStore, i
 	path := firstArg(c.Cmd)
 	args := restArgs(c.Cmd)
 	networks := store.networkSettingsForContainer(c.ID)
-	networkMode := "default"
-	if _, ok := networks["bridge"]; ok {
+	networkMode := strings.TrimSpace(c.NetworkMode)
+	if networkMode == "" {
 		networkMode = "bridge"
+	}
+	switch strings.ToLower(networkMode) {
+	case "none", "host":
+		networks = map[string]interface{}{
+			strings.ToLower(networkMode): map[string]interface{}{
+				"NetworkID":           strings.ToLower(networkMode),
+				"EndpointID":          "",
+				"Gateway":             "",
+				"IPAddress":           "",
+				"IPPrefixLen":         0,
+				"IPv6Gateway":         "",
+				"GlobalIPv6Address":   "",
+				"GlobalIPv6PrefixLen": 0,
+				"MacAddress":          "",
+				"Aliases":             []string{},
+			},
+		}
 	}
 	resp := map[string]interface{}{
 		"Id":      c.ID,

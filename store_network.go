@@ -242,3 +242,34 @@ func (s *containerStore) networkSettingsForContainer(containerID string) map[str
 	}
 	return out
 }
+
+func (s *containerStore) peerAliasesForContainer(containerID string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureNetworksMapLocked()
+	aliases := map[string]struct{}{}
+	for _, n := range s.networks {
+		if _, attached := n.Containers[containerID]; !attached {
+			continue
+		}
+		for peerID, ep := range n.Containers {
+			if peerID == containerID || ep == nil {
+				continue
+			}
+			for _, alias := range ep.Aliases {
+				if alias = strings.TrimSpace(alias); alias != "" {
+					aliases[alias] = struct{}{}
+				}
+			}
+			if ep.Name != "" {
+				aliases[ep.Name] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(aliases))
+	for alias := range aliases {
+		out = append(out, alias)
+	}
+	sort.Strings(out)
+	return out
+}
