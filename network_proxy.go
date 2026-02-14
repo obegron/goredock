@@ -147,10 +147,10 @@ func parseDockerBool(raw string, defaultValue bool) bool {
 	return raw == "1" || raw == "true"
 }
 
-func startPortProxies(ports map[int]int) ([]*portProxy, error) {
+func startPortProxies(ports map[int]int, targets map[int]string) ([]*portProxy, error) {
 	var proxies []*portProxy
 	for containerPort, hostPort := range ports {
-		proxy, err := startPortProxy(hostPort, containerPort)
+		proxy, err := startPortProxy(hostPort, containerPort, targets[containerPort])
 		if err != nil {
 			for _, p := range proxies {
 				p.stopProxy()
@@ -162,7 +162,7 @@ func startPortProxies(ports map[int]int) ([]*portProxy, error) {
 	return proxies, nil
 }
 
-func startPortProxy(hostPort, containerPort int) (*portProxy, error) {
+func startPortProxy(hostPort, containerPort int, target string) (*portProxy, error) {
 	ln, err := net.Listen("tcp", ":"+strconv.Itoa(hostPort))
 	if err != nil {
 		return nil, err
@@ -179,7 +179,7 @@ func startPortProxy(hostPort, containerPort int) (*portProxy, error) {
 					return
 				}
 			}
-			go proxyConn(conn, containerPort)
+			go proxyConn(conn, containerPort, target)
 		}
 	}()
 	return p, nil
@@ -195,9 +195,9 @@ func (p *portProxy) stopProxy() {
 	}
 }
 
-func proxyConn(src net.Conn, containerPort int) {
+func proxyConn(src net.Conn, containerPort int, target string) {
 	defer src.Close()
-	dst, err := dialContainerPort(containerPort)
+	dst, err := dialContainerPort(containerPort, target)
 	if err != nil {
 		fmt.Printf("sidewhale: proxy dial failed containerPort=%d err=%v\n", containerPort, err)
 		return
@@ -267,7 +267,10 @@ func closeWrite(conn net.Conn) error {
 	return tcp.CloseWrite()
 }
 
-func dialContainerPort(containerPort int) (net.Conn, error) {
+func dialContainerPort(containerPort int, target string) (net.Conn, error) {
+	if strings.TrimSpace(target) != "" {
+		return net.DialTimeout("tcp", target, 2*time.Second)
+	}
 	port := strconv.Itoa(containerPort)
 	endpoints := []string{
 		"127.0.0.1:" + port,

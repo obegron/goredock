@@ -204,6 +204,11 @@ func isConfluentKafkaImage(image string) bool {
 	return strings.Contains(image, "confluentinc/cp-kafka")
 }
 
+func isRedisImage(image string) bool {
+	image = strings.ToLower(normalizeImageToken(image))
+	return strings.Contains(image, "redis")
+}
+
 func dockerHostForInnerClients(unixSocketPath, requestHost string) string {
 	if strings.TrimSpace(unixSocketPath) != "" {
 		return "unix://" + unixSocketPath

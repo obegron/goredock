@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -229,4 +230,24 @@ func (s *containerStore) stopAllRunning(grace time.Duration) int {
 		s.stopProxies(id)
 	}
 	return stopped
+}
+
+func (s *containerStore) allocateLoopbackIP() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	used := map[string]struct{}{}
+	for _, c := range s.containers {
+		if ip := strings.TrimSpace(c.LoopbackIP); ip != "" {
+			used[ip] = struct{}{}
+		}
+	}
+	for octet := 2; octet <= 254; octet++ {
+		ip := fmt.Sprintf("127.0.0.%d", octet)
+		if _, ok := used[ip]; ok {
+			continue
+		}
+		return ip, nil
+	}
+	return "", fmt.Errorf("no loopback ip available")
 }

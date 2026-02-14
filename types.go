@@ -19,6 +19,7 @@ type Container struct {
 	Running      bool      `json:"Running"`
 	ExitCode     int       `json:"ExitCode"`
 	Ports        map[int]int
+	PortTargets  map[int]string      `json:"PortTargets,omitempty"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
 	Env          []string            `json:"Env"`
 	LogPath      string              `json:"LogPath"`
@@ -27,6 +28,7 @@ type Container struct {
 	Pid          int                 `json:"Pid"`
 	Cmd          []string            `json:"Cmd"`
 	WorkingDir   string              `json:"WorkingDir"`
+	LoopbackIP   string              `json:"LoopbackIP,omitempty"`
 }
 
 type containerStore struct {

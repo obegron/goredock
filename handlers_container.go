@@ -165,6 +165,26 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 		cmdArgs = []string{"sleep", "3600"}
 	}
 	cmdArgs = resolveCommandInRootfs(c.Rootfs, c.Env, cmdArgs)
+	runtimeTargets := clonePortTargets(c.PortTargets)
+	if isRedisImage(c.Image) {
+		if strings.TrimSpace(c.LoopbackIP) == "" {
+			ip, allocErr := store.allocateLoopbackIP()
+			if allocErr != nil {
+				if reserved {
+					m.mu.Lock()
+					if m.running > 0 {
+						m.running--
+					}
+					m.mu.Unlock()
+				}
+				writeError(w, http.StatusInternalServerError, "start failed: "+allocErr.Error())
+				return
+			}
+			c.LoopbackIP = ip
+		}
+		cmdArgs = applyRedisRuntimeCompat(cmdArgs, c.LoopbackIP)
+		runtimeTargets[6379] = c.LoopbackIP + ":6379"
+	}
 
 	socketBinds, err := dockerSocketBindsForContainer(c, unixSocketPathFromContainerEnv(c.Env))
 	if err != nil {
@@ -265,7 +285,7 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 		return
 	}
 
-	proxies, err := startPortProxies(c.Ports)
+	proxies, err := startPortProxies(c.Ports, runtimeTargets)
 	if err != nil {
 		_ = killProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 		closeLogs()
@@ -286,6 +306,7 @@ func handleStart(w http.ResponseWriter, r *http.Request, store *containerStore, 
 	c.ExitCode = 0
 	c.StartedAt = time.Now().UTC()
 	c.FinishedAt = time.Time{}
+	c.PortTargets = runtimeTargets
 	if err := store.save(c); err != nil {
 		_ = killProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 		store.stopProxies(c.ID)
@@ -720,4 +741,33 @@ func containerFinishedAt(c *Container) time.Time {
 		return c.Created
 	}
 	return time.Time{}
+}
+
+func clonePortTargets(in map[int]string) map[int]string {
+	out := make(map[int]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func applyRedisRuntimeCompat(cmdArgs []string, loopbackIP string) []string {
+	if len(cmdArgs) == 0 || strings.TrimSpace(loopbackIP) == "" {
+		return cmdArgs
+	}
+	if hasArg(cmdArgs, "--bind") {
+		return cmdArgs
+	}
+	out := append([]string{}, cmdArgs...)
+	out = append(out, "--bind", loopbackIP)
+	return out
+}
+
+func hasArg(args []string, needle string) bool {
+	for _, arg := range args {
+		if arg == needle {
+			return true
+		}
+	}
+	return false
 }
