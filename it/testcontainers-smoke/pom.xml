@@ -10,7 +10,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <junit.version>5.10.2</junit.version>
     <testcontainers.version>1.21.3</testcontainers.version>
-    <postgresql.version>42.7.4</postgresql.version>
+    <postgresql.version>42.7.7</postgresql.version>
   </properties>
 
   <dependencies>
