@@ -90,7 +90,8 @@ func handleArchivePut(w http.ResponseWriter, r *http.Request, store *containerSt
 		writeError(w, http.StatusBadRequest, "invalid archive path")
 		return
 	}
-	if err := extractArchiveToPath(r.Body, targetPath, func(dst string) string {
+	tmpBase := filepath.Join(filepath.Dir(c.Rootfs), "tmp")
+	if err := extractArchiveToPath(r.Body, targetPath, tmpBase, func(dst string) string {
 		return mapArchiveDestinationPath(c, dst)
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "archive extract failed: "+err.Error())
@@ -132,8 +133,15 @@ func resolvePathUnder(base string, rel string) (string, error) {
 	return full, nil
 }
 
-func extractArchiveToPath(r io.Reader, targetPath string, mapDst func(string) string) error {
-	tmpDir, err := os.MkdirTemp("", "sidewhale-archive-*")
+func extractArchiveToPath(r io.Reader, targetPath, tmpBase string, mapDst func(string) string) error {
+	base := strings.TrimSpace(tmpBase)
+	if base == "" {
+		base = os.TempDir()
+	}
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return err
+	}
+	tmpDir, err := os.MkdirTemp(base, "sidewhale-archive-*")
 	if err != nil {
 		return err
 	}
