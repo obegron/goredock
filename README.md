@@ -120,3 +120,9 @@ make integration-test
 ```
 
 By default this target sets `TESTCONTAINERS_RYUK_DISABLED=true`. Override if needed.
+
+## Compatibility Matrix
+
+For current host-backend compatibility status across Testcontainers modules, see:
+
+- `docs/compatibility-matrix.md`
