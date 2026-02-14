@@ -35,6 +35,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "startup check failed: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Printf(
+		"sidewhale starting version=%s git_commit=%s go=%s build_time=%s backend=%s listen=%s unix=%s state_dir=%s\n",
+		version,
+		gitCommit,
+		goVersion,
+		buildTime,
+		cfg.runtimeBackend,
+		cfg.listenAddr,
+		cfg.unixSocketPath,
+		cfg.stateDir,
+	)
 
 	store := &containerStore{
 		containers: make(map[string]*Container),
