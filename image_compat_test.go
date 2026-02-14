@@ -40,3 +40,52 @@ func TestApplyImageCompatKafkaTokenDedup(t *testing.T) {
 		t.Fatalf("expected KAFKA_OPTS unchanged, got %q", val)
 	}
 }
+
+func TestApplyImageCompatAddsZookeeperJavaFlags(t *testing.T) {
+	env := applyImageCompat(nil, "zk", "library/zookeeper:3.8.0", "library/zookeeper:3.8.0", "", "")
+	jvmFlags := ""
+	javaToolOptions := ""
+	for _, e := range env {
+		k, v := splitEnv(e)
+		if k == "JVMFLAGS" {
+			jvmFlags = v
+		}
+		if k == "JAVA_TOOL_OPTIONS" {
+			javaToolOptions = v
+		}
+	}
+	if jvmFlags == "" || javaToolOptions == "" {
+		t.Fatalf("expected both JVMFLAGS and JAVA_TOOL_OPTIONS, got %v", env)
+	}
+	if jvmFlags != "-XX:-UseContainerSupport" {
+		t.Fatalf("expected JVMFLAGS token, got %q", jvmFlags)
+	}
+	if javaToolOptions != "-XX:-UseContainerSupport" {
+		t.Fatalf("expected JAVA_TOOL_OPTIONS token, got %q", javaToolOptions)
+	}
+}
+
+func TestApplyImageCompatZookeeperTokenDedup(t *testing.T) {
+	initial := []string{
+		"JVMFLAGS=-Xmx256m -XX:-UseContainerSupport",
+		"JAVA_TOOL_OPTIONS=-Dfoo=bar -XX:-UseContainerSupport",
+	}
+	env := applyImageCompat(initial, "zk", "confluentinc/cp-zookeeper:6.2.1", "confluentinc/cp-zookeeper:6.2.1", "", "")
+	jvmFlags := ""
+	javaToolOptions := ""
+	for _, e := range env {
+		k, v := splitEnv(e)
+		if k == "JVMFLAGS" {
+			jvmFlags = v
+		}
+		if k == "JAVA_TOOL_OPTIONS" {
+			javaToolOptions = v
+		}
+	}
+	if jvmFlags != "-Xmx256m -XX:-UseContainerSupport" {
+		t.Fatalf("unexpected JVMFLAGS %q", jvmFlags)
+	}
+	if javaToolOptions != "-Dfoo=bar -XX:-UseContainerSupport" {
+		t.Fatalf("unexpected JAVA_TOOL_OPTIONS %q", javaToolOptions)
+	}
+}

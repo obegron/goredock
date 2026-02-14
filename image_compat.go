@@ -32,6 +32,12 @@ func applyImageCompat(env []string, hostname, resolvedImage, requestedImage, uni
 		}
 		env = ensureEnvContainsToken(env, "KAFKA_OPTS", "-Dzookeeper.admin.enableServer=false")
 	}
+	if isZookeeperImage(resolvedImage) || isZookeeperImage(requestedImage) {
+		// Under proot, JVM container metrics may panic in cgroupv2 detection.
+		// Disable container support for zookeeper-family images by default.
+		env = ensureEnvContainsToken(env, "JVMFLAGS", "-XX:-UseContainerSupport")
+		env = ensureEnvContainsToken(env, "JAVA_TOOL_OPTIONS", "-XX:-UseContainerSupport")
+	}
 	if isRyukImage(resolvedImage) || isRyukImage(requestedImage) {
 		env = mergeEnv(env, []string{"DOCKER_HOST=" + dockerHostForInnerClients(unixSocketPath, requestHost)})
 	}

@@ -220,6 +220,13 @@ func isLLdapImage(image string) bool {
 	return strings.Contains(image, "lldap/lldap")
 }
 
+func isZookeeperImage(image string) bool {
+	image = strings.ToLower(normalizeImageToken(image))
+	return strings.Contains(image, "/zookeeper:") ||
+		strings.HasSuffix(image, "/zookeeper") ||
+		strings.Contains(image, "cp-zookeeper")
+}
+
 func dockerHostForInnerClients(unixSocketPath, requestHost string) string {
 	if strings.TrimSpace(unixSocketPath) != "" {
 		return "unix://" + unixSocketPath
